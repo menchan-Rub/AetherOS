@@ -543,3 +543,107 @@ pub fn unmap_range(page_table: &mut PageTable, virt_start: VirtualAddress, size:
     
     success
 } 
+
+/// 予測されたページをプリフェッチ
+/// 
+/// この関数は予測的ページングエンジンから呼び出され、指定されたページをメモリに
+/// 先読みします。プリフェッチは非同期かつベストエフォートで行われます。
+pub fn prefetch_page(page_frame: usize, process_id: Option<usize>) -> Result<(), &'static str> {
+    // プロセスIDが指定されている場合はそのプロセスのアドレス空間を使用
+    // そうでなければカーネルのアドレス空間を使用
+    let page_table = if let Some(pid) = process_id {
+        match process::get_process(pid) {
+            Some(proc) => proc.get_page_table(),
+            None => return Err("指定されたプロセスが見つかりません"),
+        }
+    } else {
+        // カーネルページテーブルを使用
+        get_kernel_page_table()
+    };
+    
+    // ページフレームを仮想アドレスに変換
+    // 注: これは単純化された実装で、実際にはプロセスのVMAやマッピング情報に基づいて
+    // 正確な仮想アドレスを解決する必要があります
+    let virt_addr = match process_id {
+        Some(_) => {
+            // ユーザープロセスの場合、ページフレームから仮想アドレスを解決
+            // 実際の実装ではもっと複雑な変換が必要
+            match find_virtual_address(page_table, page_frame) {
+                Some(addr) => addr,
+                None => return Err("ページフレームに対応する仮想アドレスが見つかりません"),
+            }
+        },
+        None => {
+            // カーネルの場合は直接マッピングの可能性が高い
+            // アーキテクチャによって異なる
+            PhysicalAddress::from_usize(page_frame * PageSize::Default as usize)
+                .to_virtual_direct()
+        }
+    };
+    
+    // ページが既にマップされているかチェック
+    if paging::translate(page_table.root, virt_addr).is_some() {
+        // 既にマップ済み、何もする必要なし
+        return Ok(());
+    }
+    
+    // プリフェッチキューに登録
+    // 実際の実装では、非同期I/Oや専用のプリフェッチスレッドを使用
+    enqueue_prefetch_request(virt_addr, process_id);
+    
+    Ok(())
+}
+
+/// プリフェッチリクエストをキューに登録
+fn enqueue_prefetch_request(virt_addr: VirtualAddress, process_id: Option<usize>) {
+    // 実際の実装では、非同期I/Oキューやプリフェッチワーカースレッドにリクエストを登録
+    // この簡略化版では、単にログ出力を行う
+    log::debug!("プリフェッチリクエスト: アドレス=0x{:x}, プロセス={:?}", 
+               virt_addr.as_usize(), process_id);
+    
+    // 実際のプリフェッチ処理は非同期に行われる
+    // ここではバックグラウンドタスクをスケジュールするだけ
+    #[cfg(feature = "async_prefetch")]
+    schedule_prefetch_task(virt_addr, process_id);
+}
+
+/// 仮想アドレスをプリフェッチ（アドレス空間内）
+pub fn prefetch_virtual_address(virt_addr: VirtualAddress, process_id: Option<usize>) -> Result<(), &'static str> {
+    // アドレスをページ境界にアライン
+    let page_size = PageSize::Default as usize;
+    let page_addr = VirtualAddress::from_usize(virt_addr.as_usize() & !(page_size - 1));
+    
+    // プロセスIDが指定されている場合はそのプロセスのアドレス空間を使用
+    let addr_space = if let Some(pid) = process_id {
+        match process::get_process(pid) {
+            Some(proc) => proc.get_address_space(),
+            None => return Err("指定されたプロセスが見つかりません"),
+        }
+    } else {
+        // カーネルアドレス空間を使用
+        get_kernel_address_space()
+    };
+    
+    // アドレスをVMAにマッピング済みか確認
+    if !addr_space.is_mapped(page_addr) {
+        return Err("指定されたアドレスはマップされていません");
+    }
+    
+    // すでにページが存在するか確認
+    if addr_space.is_present(page_addr) {
+        // 既にメモリに存在する場合は何もしない
+        return Ok(());
+    }
+    
+    // プリフェッチキューに登録
+    enqueue_prefetch_request(page_addr, process_id);
+    
+    Ok(())
+}
+
+/// 物理ページフレームから対応する仮想アドレスを探す
+fn find_virtual_address(page_table: &PageTable, page_frame: usize) -> Option<VirtualAddress> {
+    // 実際の実装では、マッピング情報を逆引きするデータ構造が必要
+    // この実装は単純化のためのダミー
+    None
+} 
