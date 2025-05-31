@@ -6,6 +6,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use core::mem;
+use crate::memory::PAGE_SIZE;
 
 /// ブロックマジックナンバー（メモリ破損検出用）
 const BLOCK_MAGIC: u32 = 0xA173_05A1;
@@ -232,4 +233,148 @@ impl BlockHeader {
 /// BlockHeaderをスレッド間で共有可能とマーク
 unsafe impl Send for BlockHeader {}
 /// BlockHeaderをスレッド間で同期可能とマーク
-unsafe impl Sync for BlockHeader {} 
+unsafe impl Sync for BlockHeader {}
+
+/// バディブロック構造体
+/// バディシステムの基本要素
+#[derive(Debug, Clone, Copy)]
+pub struct BuddyBlock {
+    /// ブロックのベースアドレス
+    pub base_addr: usize,
+    
+    /// ブロックのオーダー (サイズ = 2^order * PAGE_SIZE)
+    pub order: usize,
+}
+
+impl BuddyBlock {
+    /// 新しいバディブロックを作成
+    pub fn new(base_addr: usize, order: usize) -> Self {
+        BuddyBlock {
+            base_addr,
+            order,
+        }
+    }
+    
+    /// ブロックのサイズをページ数で取得
+    pub fn size(&self) -> usize {
+        1 << self.order
+    }
+    
+    /// ブロックのサイズをバイト数で取得
+    pub fn size_bytes(&self) -> usize {
+        self.size() * PAGE_SIZE
+    }
+    
+    /// このブロックのバディブロックを計算
+    pub fn buddy(&self) -> Self {
+        let buddy_addr = self.base_addr ^ (self.size() * PAGE_SIZE);
+        
+        BuddyBlock {
+            base_addr: buddy_addr,
+            order: self.order,
+        }
+    }
+    
+    /// ブロックを分割して子ブロックを取得
+    pub fn split(&self) -> (Self, Self) {
+        if self.order == 0 {
+            // オーダー0は分割できない
+            return (*self, *self);
+        }
+        
+        let new_order = self.order - 1;
+        let new_size = 1 << new_order;
+        
+        let left = BuddyBlock {
+            base_addr: self.base_addr,
+            order: new_order,
+        };
+        
+        let right = BuddyBlock {
+            base_addr: self.base_addr + (new_size * PAGE_SIZE),
+            order: new_order,
+        };
+        
+        (left, right)
+    }
+    
+    /// 指定されたアドレスがこのブロック内にあるか
+    pub fn contains(&self, addr: usize) -> bool {
+        addr >= self.base_addr && addr < self.base_addr + self.size_bytes()
+    }
+    
+    /// 他のブロックとマージ可能か
+    pub fn can_merge_with(&self, other: &Self) -> bool {
+        // 同じオーダーであること
+        if self.order != other.order {
+            return false;
+        }
+        
+        // 互いにバディであること
+        self.buddy().base_addr == other.base_addr
+    }
+    
+    /// バディブロックとマージして親ブロックを作成
+    pub fn merge_with(&self, other: &Self) -> Option<Self> {
+        if !self.can_merge_with(other) {
+            return None;
+        }
+        
+        // 左側のブロックを基準にする
+        let left_addr = self.base_addr.min(other.base_addr);
+        
+        Some(BuddyBlock {
+            base_addr: left_addr,
+            order: self.order + 1,
+        })
+    }
+    
+    /// アドレスの有効性を検証
+    pub fn validate_address(&self) -> bool {
+        // ページアライメントを確認
+        if self.base_addr % PAGE_SIZE != 0 {
+            return false;
+        }
+        
+        // ブロックサイズのアライメントを確認
+        let block_alignment = self.size() * PAGE_SIZE;
+        self.base_addr % block_alignment == 0
+    }
+    
+    /// ページフレーム番号を取得
+    pub fn pfn(&self) -> usize {
+        self.base_addr / PAGE_SIZE
+    }
+    
+    /// バディのページフレーム番号を取得
+    pub fn buddy_pfn(&self) -> usize {
+        self.buddy().base_addr / PAGE_SIZE
+    }
+    
+    /// ブロック内のオフセットを計算
+    pub fn offset(&self, addr: usize) -> usize {
+        if !self.contains(addr) {
+            return 0;
+        }
+        
+        addr - self.base_addr
+    }
+    
+    /// ブロック内の指定オフセットアドレスを計算
+    pub fn address_at_offset(&self, offset: usize) -> usize {
+        if offset >= self.size_bytes() {
+            return self.base_addr;
+        }
+        
+        self.base_addr + offset
+    }
+}
+
+/// ブロック同士の比較
+impl core::cmp::PartialEq for BuddyBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_addr == other.base_addr && self.order == other.order
+    }
+}
+
+impl core::cmp::Eq for BuddyBlock {} 

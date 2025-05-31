@@ -10,6 +10,9 @@ use spin::{Mutex, RwLock};
 use crate::arch::{PageSize, DmaCapabilities, DmaChannelType};
 use crate::core::memory::{mm, cxl, pmem, numa, MemoryTier};
 use crate::drivers::dma::{self, DmaRequest, DmaTransferType, DmaCallback, DmaFlags};
+use alloc::sync::Arc;
+use alloc::boxed::Box;
+use core::ptr::NonNull;
 
 /// 転送方式
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -54,6 +57,121 @@ pub enum TransferStatus {
     Failed,
     /// キャンセル済み
     Cancelled,
+}
+
+/// ゼロコピーマッピングフラグ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingFlags {
+    /// 読み取り専用マッピング
+    ReadOnly,
+    /// 読み書き可能マッピング
+    ReadWrite,
+    /// キャッシュ不可
+    Uncached,
+    /// ライトスルー
+    WriteThrough,
+    /// ライトバック
+    WriteBack,
+}
+
+/// RDMAデバイスID
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceId(u32);
+
+impl DeviceId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+    
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+/// RDMAデバイストレイト
+pub trait RdmaDevice: Send + Sync {
+    fn get_id(&self) -> DeviceId;
+    fn get_name(&self) -> &str;
+    fn get_capabilities(&self) -> RdmaCapabilities;
+    fn register_memory(&self, addr: usize, size: usize, flags: RdmaMemoryFlags) -> Result<RdmaMemoryRegion, TransportError>;
+    fn deregister_memory(&self, region: &RdmaMemoryRegion) -> Result<(), TransportError>;
+    fn post_send(&self, region: &RdmaMemoryRegion, remote_addr: usize, size: usize) -> Result<RdmaOperationId, TransportError>;
+    fn post_recv(&self, region: &RdmaMemoryRegion, size: usize) -> Result<RdmaOperationId, TransportError>;
+    fn poll_completion(&self) -> Result<Option<RdmaCompletion>, TransportError>;
+    fn wait_completion(&self, timeout_ms: Option<u64>) -> Result<RdmaCompletion, TransportError>;
+}
+
+/// RDMAメモリリージョン
+#[derive(Debug)]
+pub struct RdmaMemoryRegion {
+    pub device_id: DeviceId,
+    pub local_addr: usize,
+    pub size: usize,
+    pub lkey: u32,
+    pub rkey: u32,
+}
+
+/// RDMAメモリフラグ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdmaMemoryFlags {
+    /// ローカルWrite可能
+    LocalWrite,
+    /// リモートRead可能
+    RemoteRead,
+    /// リモートWrite可能
+    RemoteWrite,
+    /// リモートアトミック操作可能
+    RemoteAtomic,
+}
+
+/// RDMAキャパビリティ
+#[derive(Debug, Clone)]
+pub struct RdmaCapabilities {
+    pub max_qp: usize,
+    pub max_send_wr: usize,
+    pub max_recv_wr: usize,
+    pub max_send_sge: usize,
+    pub max_recv_sge: usize,
+    pub max_inline_data: usize,
+    pub supports_rdma_read: bool,
+    pub supports_rdma_write: bool,
+    pub supports_atomic: bool,
+}
+
+/// RDMA操作ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdmaOperationId(u64);
+
+/// RDMA完了通知
+#[derive(Debug)]
+pub struct RdmaCompletion {
+    pub operation_id: RdmaOperationId,
+    pub status: RdmaCompletionStatus,
+    pub bytes_transferred: usize,
+}
+
+/// RDMA完了ステータス
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdmaCompletionStatus {
+    Success,
+    Error,
+    RemoteAccessError,
+    RemoteOperationError,
+    TransportError,
+}
+
+/// トランスポートエラー
+#[derive(Debug)]
+pub enum TransportError {
+    NotSupported,
+    ResourceLimitExceeded,
+    InvalidArgument,
+    InvalidOperation,
+    DeviceError,
+    ConnectionError,
+    MemoryRegistrationFailed,
+    TimeoutError,
+    InternalError(String),
 }
 
 /// ゼロコピー転送ディスクリプタ
@@ -810,5 +928,438 @@ mod tests {
         // メモリ解放
         let _ = crate::core::memory::allocator::free(src, src_size);
         let _ = crate::core::memory::allocator::free(dst, src_size);
+    }
+}
+
+// ゼロコピー転送ディスクリプタ
+#[derive(Debug)]
+pub struct ZeroCopyTransferDescriptor {
+    pub source_addr: usize,
+    pub destination_addr: usize,
+    pub size: usize,
+    pub flags: u32,
+    pub transfer_id: u64,
+    pub completion_callback: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+}
+
+// 連続メモリ割り当て（実装）
+fn allocate_contiguous_memory(size: usize, flags: MappingFlags) -> Result<(NonNull<u8>, usize), &'static str> {
+    log::debug!("連続メモリ割り当て: サイズ={}バイト", size);
+    
+    // ページ境界に整列したサイズを計算
+    let page_size = crate::arch::get_page_size();
+    let aligned_size = (size + page_size - 1) & !(page_size - 1);
+    
+    // 物理メモリアロケータから連続メモリを取得
+    let phys_allocator = crate::arch::get_physical_allocator();
+    
+    match phys_allocator.allocate_contiguous(aligned_size) {
+        Ok(phys_addr) => {
+            // 物理アドレスを仮想アドレスにマップ
+            let virt_addr = map_physical_memory(phys_addr, aligned_size, flags)?;
+            
+            // NonNull<u8>に変換
+            let non_null_ptr = NonNull::new(virt_addr as *mut u8)
+                .ok_or("メモリマッピングに失敗")?;
+            
+            log::debug!("連続メモリ割り当て成功: 物理={:#x}, 仮想={:#x}, サイズ={}",
+                       phys_addr, virt_addr, aligned_size);
+            
+            Ok((non_null_ptr, aligned_size))
+        },
+        Err(e) => {
+            log::error!("連続メモリ割り当てに失敗: {:?}", e);
+            Err("連続メモリの割り当てに失敗しました")
+        }
+    }
+}
+
+fn map_physical_memory(phys_addr: usize, size: usize, flags: MappingFlags) -> Result<usize, &'static str> {
+    let vm_manager = crate::arch::get_vm_manager();
+    
+    // 適切な仮想アドレス範囲を見つける
+    let virt_addr = vm_manager.find_free_region(size)
+        .ok_or("仮想アドレス空間が不足")?;
+    
+    // ページテーブルエントリのフラグを設定
+    let page_flags = convert_mapping_flags_to_page_flags(flags);
+    
+    // 物理メモリを仮想アドレスにマップ
+    for offset in (0..size).step_by(crate::arch::get_page_size()) {
+        let page_phys = phys_addr + offset;
+        let page_virt = virt_addr + offset;
+        
+        vm_manager.map_page(page_virt, page_phys, page_flags)?;
+    }
+    
+    Ok(virt_addr)
+}
+
+fn convert_mapping_flags_to_page_flags(flags: MappingFlags) -> crate::arch::PageFlags {
+    let mut page_flags = crate::arch::PageFlags::PRESENT;
+    
+    match flags {
+        MappingFlags::ReadOnly => {
+            // 読み取り専用
+        },
+        MappingFlags::ReadWrite => {
+            page_flags |= crate::arch::PageFlags::WRITABLE;
+        },
+        MappingFlags::Uncached => {
+            page_flags |= crate::arch::PageFlags::UNCACHEABLE;
+        },
+        MappingFlags::WriteThrough => {
+            page_flags |= crate::arch::PageFlags::WRITE_THROUGH;
+        },
+        MappingFlags::WriteBack => {
+            page_flags |= crate::arch::PageFlags::WRITE_BACK;
+        },
+    }
+    
+    page_flags
+}
+
+// RDMAデバイス取得（実装）
+fn get_rdma_device(device_id: DeviceId) -> Result<Arc<dyn RdmaDevice>, TransportError> {
+    log::debug!("RDMAデバイス取得: ID={}", device_id.as_u32());
+    
+    // グローバルデバイスマネージャからRDMAデバイスを取得
+    let device_manager = crate::arch::get_device_manager();
+    
+    if let Some(device) = device_manager.get_rdma_device(device_id) {
+        // デバイスが利用可能か確認
+        if device.is_available() {
+            log::debug!("RDMAデバイス取得成功: {}", device.get_name());
+            Ok(device)
+        } else {
+            log::warn!("RDMAデバイスは利用できません: {}", device.get_name());
+            Err(TransportError::DeviceError)
+        }
+    } else {
+        log::error!("RDMAデバイスが見つかりません: ID={}", device_id.as_u32());
+        Err(TransportError::DeviceError)
+    }
+}
+
+// ゼロコピートランスファーマネージャ
+pub struct ZeroCopyTransferManager {
+    active_transfers: Mutex<alloc::collections::BTreeMap<u64, ZeroCopyTransferDescriptor>>,
+    next_transfer_id: AtomicUsize,
+    registered_regions: Mutex<alloc::collections::BTreeMap<usize, (DeviceId, RdmaMemoryRegion)>>,
+}
+
+impl ZeroCopyTransferManager {
+    pub fn new() -> Self {
+        Self {
+            active_transfers: Mutex::new(alloc::collections::BTreeMap::new()),
+            next_transfer_id: AtomicUsize::new(1),
+            registered_regions: Mutex::new(alloc::collections::BTreeMap::new()),
+        }
+    }
+    
+    pub fn register_memory(&self, addr: usize, size: usize, device_id: DeviceId) -> Result<(), TransportError> {
+        // すでに登録済みかチェック
+        let mut regions = self.registered_regions.lock();
+        if regions.contains_key(&addr) {
+            return Ok(());
+        }
+        
+        // RDMAデバイスを取得
+        let device = get_rdma_device(device_id)?;
+        
+        // メモリリージョン登録
+        let region = device.register_memory(
+            addr,
+            size,
+            RdmaMemoryFlags::LocalWrite | RdmaMemoryFlags::RemoteRead | RdmaMemoryFlags::RemoteWrite
+        )?;
+        
+        // 登録情報保存
+        regions.insert(addr, (device_id, region));
+        
+        Ok(())
+    }
+    
+    pub fn unregister_memory(&self, addr: usize) -> Result<(), TransportError> {
+        let mut regions = self.registered_regions.lock();
+        
+        if let Some((device_id, region)) = regions.remove(&addr) {
+            // デバイスを取得
+            let device = get_rdma_device(device_id)?;
+            
+            // メモリリージョン登録解除
+            device.deregister_memory(&region)?;
+        }
+        
+        Ok(())
+    }
+    
+    pub fn initiate_transfer(&self, desc: &ZeroCopyTransferDescriptor) -> Result<u64, TransportError> {
+        log::debug!("ゼロコピー転送開始: ソース={:#x}, 宛先={:#x}, サイズ={}",
+                   desc.source_addr, desc.destination_addr, desc.size);
+        
+        // 転送IDを生成
+        let transfer_id = self.generate_transfer_id();
+        
+        // 転送記述子をアクティブリストに追加
+        {
+            let mut transfers = self.active_transfers.lock();
+            transfers.insert(transfer_id, desc.clone());
+        }
+        
+        // 最適なデバイスを選択
+        let device_id = determine_device_for_transfer(desc)?;
+        
+        // デバイス固有の転送を開始
+        self.initiate_device_transfer(device_id, desc)?;
+        
+        log::debug!("ゼロコピー転送開始完了: ID={}", transfer_id);
+        Ok(transfer_id)
+    }
+    
+    fn generate_transfer_id(&self) -> u64 {
+        self.next_transfer_id.fetch_add(1, Ordering::SeqCst) as u64
+    }
+    
+    fn initiate_device_transfer(&self, device_id: DeviceId, desc: &ZeroCopyTransferDescriptor) -> Result<(), TransportError> {
+        let device = get_rdma_device(device_id)?;
+        
+        // メモリ領域をデバイスに登録
+        let source_region = device.register_memory(
+            desc.source_addr,
+            desc.size,
+            RdmaMemoryFlags::RemoteRead
+        )?;
+        
+        let dest_region = device.register_memory(
+            desc.destination_addr,
+            desc.size,
+            RdmaMemoryFlags::RemoteWrite
+        )?;
+        
+        // RDMA転送を開始
+        let operation_id = device.post_send(&source_region, desc.destination_addr, desc.size)?;
+        
+        log::debug!("RDMA転送開始: 操作ID={:?}", operation_id);
+        Ok(())
+    }
+    
+    pub fn poll_completions(&self) -> Result<bool, TransportError> {
+        let mut completed_transfers = Vec::new();
+        
+        // 登録されたメモリ領域から完了したものを検索
+        {
+            let regions = self.registered_regions.lock();
+            for (&addr, (device_id, region)) in regions.iter() {
+                let device = get_rdma_device(*device_id)?;
+                
+                if let Ok(Some(completion)) = device.poll_completion() {
+                    // 完了した転送を記録
+                    completed_transfers.push((completion, addr));
+                }
+            }
+        }
+        
+        // 完了した転送の後処理
+        for (completion, addr) in completed_transfers {
+            self.handle_transfer_completion(completion, addr)?;
+        }
+        
+        Ok(!completed_transfers.is_empty())
+    }
+    
+    fn handle_transfer_completion(&self, completion: RdmaCompletion, addr: usize) -> Result<(), TransportError> {
+        log::debug!("転送完了処理: アドレス={:#x}, 状態={:?}", addr, completion.status);
+        
+        match completion.status {
+            RdmaCompletionStatus::Success => {
+                // 成功時の処理
+                self.cleanup_transfer_resources(addr)?;
+                log::debug!("転送成功: {}バイト転送完了", completion.bytes_transferred);
+            },
+            RdmaCompletionStatus::Error => {
+                log::error!("転送エラーが発生");
+                self.cleanup_transfer_resources(addr)?;
+                return Err(TransportError::TransportError);
+            },
+            _ => {
+                log::warn!("予期しない転送完了状態: {:?}", completion.status);
+                self.cleanup_transfer_resources(addr)?;
+                return Err(TransportError::InternalError("予期しない完了状態".to_string()));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn cleanup_transfer_resources(&self, addr: usize) -> Result<(), TransportError> {
+        // メモリ領域の登録を解除
+        let mut regions = self.registered_regions.lock();
+        if let Some((device_id, region)) = regions.remove(&addr) {
+            let device = get_rdma_device(device_id)?;
+            device.deregister_memory(&region)?;
+            log::debug!("メモリ領域の登録解除: アドレス={:#x}", addr);
+        }
+        
+        Ok(())
+    }
+}
+
+fn determine_device_for_transfer(desc: &ZeroCopyTransferDescriptor) -> Result<DeviceId, TransportError> {
+    log::debug!("転送用デバイス選択中...");
+    
+    // デバイスマネージャから利用可能なRDMAデバイスを取得
+    let device_manager = crate::arch::get_device_manager();
+    let available_devices = device_manager.get_available_rdma_devices();
+    
+    if available_devices.is_empty() {
+        log::error!("利用可能なRDMAデバイスがありません");
+        return Err(TransportError::DeviceError);
+    }
+    
+    // 転送サイズとデバイス性能に基づいて最適なデバイスを選択
+    let mut best_device = available_devices[0];
+    let mut best_score = 0u32;
+    
+    for &device_id in &available_devices {
+        let device = device_manager.get_rdma_device(device_id)
+            .ok_or(TransportError::DeviceError)?;
+        
+        let capabilities = device.get_capabilities();
+        
+        // スコア計算（最大送信バッファサイズ、接続数などを考慮）
+        let score = calculate_device_score(&capabilities, desc.size);
+        
+        if score > best_score {
+            best_score = score;
+            best_device = device_id;
+        }
+    }
+    
+    log::debug!("最適デバイス選択: ID={}, スコア={}", best_device.as_u32(), best_score);
+    Ok(best_device)
+}
+
+fn calculate_device_score(capabilities: &RdmaCapabilities, transfer_size: usize) -> u32 {
+    let mut score = 0u32;
+    
+    // 大きな転送バッファサイズを優先
+    if capabilities.max_send_wr >= transfer_size / 4096 { // 4KBページ単位で計算
+        score += 100;
+    }
+    
+    // インライン転送が可能な場合はボーナス
+    if capabilities.max_inline_data >= transfer_size.min(1024) {
+        score += 50;
+    }
+    
+    // RDMA読み取り/書き込みサポート
+    if capabilities.supports_rdma_read {
+        score += 30;
+    }
+    if capabilities.supports_rdma_write {
+        score += 30;
+    }
+    
+    // アトミック操作サポート
+    if capabilities.supports_atomic {
+        score += 20;
+    }
+    
+    score
+}
+
+// ダミーのRDMAデバイス実装（テスト用）
+pub struct DummyRdmaDevice {
+    id: DeviceId,
+    name: String,
+    capabilities: RdmaCapabilities,
+}
+
+impl DummyRdmaDevice {
+    pub fn new(id: u32) -> Self {
+        DummyRdmaDevice {
+            id: DeviceId::new(id),
+            name: format!("Dummy RDMA Device {}", id),
+            capabilities: RdmaCapabilities {
+                max_qp: 1024,
+                max_send_wr: 4096,
+                max_recv_wr: 4096,
+                max_send_sge: 16,
+                max_recv_sge: 16,
+                max_inline_data: 512,
+                supports_rdma_read: true,
+                supports_rdma_write: true,
+                supports_atomic: true,
+            },
+        }
+    }
+}
+
+impl RdmaDevice for DummyRdmaDevice {
+    fn get_id(&self) -> DeviceId {
+        self.id
+    }
+    
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+    
+    fn get_capabilities(&self) -> RdmaCapabilities {
+        self.capabilities
+    }
+    
+    fn is_available(&self) -> bool {
+        true
+    }
+    
+    fn register_memory(&self, addr: usize, size: usize, flags: RdmaMemoryFlags) -> Result<RdmaMemoryRegion, TransportError> {
+        log::debug!("ダミーRDMA: メモリ登録 addr={:#x}, size={}", addr, size);
+        
+        Ok(RdmaMemoryRegion {
+            device_id: self.id,
+            local_addr: addr,
+            size,
+            lkey: 0x12345678, // ダミーローカルキー
+            rkey: 0x87654321, // ダミーリモートキー
+        })
+    }
+    
+    fn deregister_memory(&self, region: &RdmaMemoryRegion) -> Result<(), TransportError> {
+        log::debug!("ダミーRDMA: メモリ登録解除 addr={:#x}", region.local_addr);
+        Ok(())
+    }
+    
+    fn post_send(&self, region: &RdmaMemoryRegion, remote_addr: usize, size: usize) -> Result<RdmaOperationId, TransportError> {
+        log::debug!("ダミーRDMA: 送信開始 local={:#x}, remote={:#x}, size={}", 
+                   region.local_addr, remote_addr, size);
+        
+        // ダミー操作IDを返す
+        Ok(RdmaOperationId(0x100))
+    }
+    
+    fn post_recv(&self, region: &RdmaMemoryRegion, size: usize) -> Result<RdmaOperationId, TransportError> {
+        log::debug!("ダミーRDMA: 受信開始 addr={:#x}, size={}", region.local_addr, size);
+        Ok(RdmaOperationId(0x200))
+    }
+    
+    fn poll_completion(&self) -> Result<Option<RdmaCompletion>, TransportError> {
+        // ダミー実装：常に完了済みとして返す
+        Ok(Some(RdmaCompletion {
+            operation_id: RdmaOperationId(0x100),
+            status: RdmaCompletionStatus::Success,
+            bytes_transferred: 4096, // ダミー転送サイズ
+        }))
+    }
+    
+    fn wait_completion(&self, timeout_ms: Option<u64>) -> Result<RdmaCompletion, TransportError> {
+        // ダミー実装：即座に完了を返す
+        log::debug!("ダミーRDMA: 完了待機 timeout={:?}ms", timeout_ms);
+        
+        Ok(RdmaCompletion {
+            operation_id: RdmaOperationId(0x100),
+            status: RdmaCompletionStatus::Success,
+            bytes_transferred: 4096,
+        })
     }
 } 

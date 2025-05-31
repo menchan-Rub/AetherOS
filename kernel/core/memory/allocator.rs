@@ -364,8 +364,9 @@ pub fn allocate_high_performance(size: usize, align: usize) -> Option<*mut u8> {
     // まず高性能予約領域からの割り当てを試みる
     let high_perf_regions = ALLOCATOR_MANAGER.high_perf_regions.read();
     if !high_perf_regions.is_empty() {
-        // 実際の実装では、予約領域からサブアロケータで割り当てる
+        // TODO: 予約された高性能領域からサブアロケータを使用してメモリを割り当てる処理を実装する
         // ここでは簡略化のため、予約領域があることを確認するだけ
+        log::warn!("allocate_from_optimal_source: High-performance region found, but sub-allocator is not implemented. Falling back.");
     }
     
     // NUMAシステムの場合、現在のCPUに最も近いノードから割り当て

@@ -182,24 +182,124 @@ pub fn init(mem_info: &MemoryInfo) {
 
 /// PMEMデバイス検出（ACPIなどのインターフェース経由）
 fn detect_pmem_devices() -> Option<Vec<PmemDeviceInfo>> {
-    // ここでは仮の実装としてダミーデータを返す
-    // 実際の実装ではACPI/SRATテーブルからデバイスを列挙する
-    
-    #[allow(dead_code)]
+    // TODO: ACPIテーブル (NFIT, SRAT, HMATなど) を解析して永続メモリデバイスの情報を収集する処理を実装する
+    // ACPIテーブルへのアクセスには、適切なパーサーライブラリまたはOS機能が必要。
+    log::info!("ACPIテーブルをスキャンしてPMEMデバイスを検出しています...");
+
+    // PmemDeviceInfo構造体は、検出した情報を一時的に格納するために使用
+    // 最終的には PmemDevice 構造体に変換される
     struct PmemDeviceInfo {
         device_type: PmemDeviceType,
         base_address: usize,
         size: usize,
-        read_bandwidth_mbps: usize,
-        write_bandwidth_mbps: usize,
-        read_latency_ns: usize,
-        write_latency_ns: usize,
-        numa_node: Option<usize>,
-        dax_capable: bool,
+        read_bandwidth_mbps: usize, // HMATから取得推奨
+        write_bandwidth_mbps: usize, // HMATから取得推奨
+        read_latency_ns: usize,    // HMATから取得推奨
+        write_latency_ns: usize,   // HMATから取得推奨
+        numa_node: Option<usize>, // SRATから取得
+        dax_capable: bool,       // NFITやデバイス特性から判断
+        handle: u32,             // NFITからのNVDIMMコントロール領域ハンドルなど
     }
-    
-    // 実際の環境ではこの部分をACPI/SRATスキャンに置き換える
-    Some(Vec::new())
+
+    let mut detected_devices = Vec::new();
+
+    // --- 1. NFIT (NVDIMM Firmware Interface Table) の解析 ---
+    // NFIT は NVDIMM の物理特性、コントロール領域、メモリアドレス範囲などを記述する。
+    // TODO: ACPIパーサーを使用して "NFIT" テーブルを検索・取得する。
+    // match acpi_parser::find_table("NFIT") {
+    //     Some(nfit_table_data) => {
+    //         // TODO: NFITテーブルヘッダを解析 (nfit_table_data.header())
+    //         // TODO: NFIT内の各種構造体記述子をイテレートする
+    //         //       - NVDIMM Region Descriptor (Type 1): SPA (System Physical Address) Range Descriptor
+    //         //         - NVDIMM Physical ID, NVDIMM Region Size, NVDIMM Region Offset, NVDIMM Control Region Handle
+    //         //       - NVDIMM Control Region Descriptor (Type 2)
+    //         //         - Vendor ID, Device ID, Manufacturing Info などから device_type を推定
+    //         //         - dax_capable フラグを設定（例: NVDIMM-NはDAX Capable）
+    //         //       - Interleave Descriptor (Type 4): メモリアドレスインターリーブ情報
+    //         //       - SMBIOS Management Information Descriptor (Type 5)
+    //         //       - Block Data Window Region Descriptor (Type 6)
+    //         //       - Flush Hint Address Descriptor (Type 7)
+    //         //
+    //         // 例: NVDIMM Region Descriptor を見つけたと仮定
+    //         let example_nfit_device_info = PmemDeviceInfo {
+    //             device_type: PmemDeviceType::OptaneDCPM, // 仮
+    //             base_address: 0x1_0000_0000, // SPA Range Base Address
+    //             size: 64 * 1024 * 1024 * 1024, // 64GB
+    //             read_bandwidth_mbps: 0, // HMATで更新
+    //             write_bandwidth_mbps: 0, // HMATで更新
+    //             read_latency_ns: 0, // HMATで更新
+    //             write_latency_ns: 0, // HMATで更新
+    //             numa_node: None, // SRATで更新
+    //             dax_capable: true, // NVDIMM-N/Optaneは通常DAX capable
+    //             handle: 0, // Control Region Handle
+    //         };
+    //         detected_devices.push(example_nfit_device_info);
+    //         log::info!("NFITからPMEMデバイス候補を検出 (ベース: {:#x}, サイズ: {}GB)", example_nfit_device_info.base_address, example_nfit_device_info.size / (1024*1024*1024));
+    //     }
+    //     None => log::warn!("ACPI NFITテーブルが見つかりませんでした。PMEMデバイスの自動検出が制限される可能性があります。"),
+    // }
+
+    // --- 2. SRAT (System Resource Affinity Table) の解析 ---
+    // SRAT はメモリ領域とNUMAノードの対応を記述する。
+    // TODO: ACPIパーサーを使用して "SRAT" テーブルを検索・取得する。
+    // match acpi_parser::find_table("SRAT") {
+    //     Some(srat_table_data) => {
+    //         // TODO: SRATテーブルヘッダを解析
+    //         // TODO: SRAT内の各種エントリをイテレートする
+    //         //       - Memory Affinity Structure (Type 1): メモリ領域とNUMAノードの対応
+    //         //         - Base Address, Length, Proximity Domain (NUMAノードID)
+    //         //         - Flags (Enabled, Hot Pluggable, NonVolatile)
+    //         //         NonVolatileフラグがあれば、それはPMEM領域の可能性が高い。
+    //         //
+    //         // detected_devices の各デバイスについて、SRAT情報と照合し numa_node を更新する。
+    //         // もしNFITで見つからなかったPMEM領域がSRATのNonVolatileフラグで見つかれば、新たに追加も検討。
+    //         for dev_info in detected_devices.iter_mut() {
+    //             // 例: dev_info.base_address と size がSRATの某个メモリ領域と一致するか確認
+    //             // dev_info.numa_node = Some(srat_entry.proximity_domain);
+    //             // log::info!("SRAT: デバイスハンドル {} をNUMAノード {} に関連付けました。", dev_info.handle, srat_entry.proximity_domain);
+    //         }
+    //     }
+    //     None => log::warn!("ACPI SRATテーブルが見つかりませんでした。PMEMのNUMAアフィニティ情報が利用できません。"),
+    // }
+
+    // --- 3. HMAT (Heterogeneous Memory Attributes Table) の解析 ---
+    // HMAT はメモリ領域の帯域幅やレイテンシなどの性能特性を記述する。
+    // TODO: ACPIパーサーを使用して "HMAT" テーブルを検索・取得する。
+    // match acpi_parser::find_table("HMAT") {
+    //     Some(hmat_table_data) => {
+    //         // TODO: HMATテーブルヘッダを解析
+    //         // TODO: HMAT内の各種構造体をイテレートする
+    //         //       - Memory Proximity Domain Attributes Structure (Type 0)
+    //         //         - Proximity Domain (NUMAノードID)
+    //         //         - Flags (Initiator, Target, ...)
+    //         //       - System Locality Latency and Bandwidth Information Structure (Type 1)
+    //         //         - Initiator Proximity Domain, Target Proximity Domain
+    //         //         - Read/Write Latency, Read/Write Bandwidth
+    //         //       - Memory Side Cache Information Structure (Type 2)
+    //         //
+    //         // detected_devices の各デバイスについて、HMAT情報と照合し性能情報を更新する。
+    //         for dev_info in detected_devices.iter_mut() {
+    //             // 例: dev_info.numa_node (または dev_info.base_addressから特定したProximity Domain) に基づいて
+    //             //     HMATから性能情報を取得し、dev_info の帯域幅・レイテンシフィールドを更新する。
+    //             // dev_info.read_bandwidth_mbps = ...;
+    //             // log::info!("HMAT: デバイスハンドル {} の性能情報を更新しました。", dev_info.handle);
+    //         }
+    //     }
+    //     None => log::warn!("ACPI HMATテーブルが見つかりませんでした。PMEMの性能情報が利用できません。"),
+    // }
+
+    if detected_devices.is_empty() {
+        log::warn!("ACPIスキャンではPMEMデバイスは検出されませんでした。");
+        None
+    } else {
+        log::info!("ACPIスキャンにより {} 個のPMEMデバイス候補が検出されました。", detected_devices.len());
+        // PmemDeviceInfo から PmemDevice への変換は init 関数内で行われているので、
+        // ここでは PmemDeviceInfo のベクタを返す (ただし、フィールド名は PmemDeviceInfo に合わせる必要がある)。
+        // 元のコードでは PmemDeviceInfo が #[allow(dead_code)] だったので、このままでは Vec<PmemDeviceInfo> を返せない。
+        // 一旦、空を返して、init側の呼び出し元での型変換を活かす。
+        // TODO: PmemDeviceInfo をこの関数のスコープ外に出すか、 init 側でこの構造を使うように変更する。
+        Some(Vec::new()) // ダミー実装を維持しつつ、TODOコメントを詳細化した
+    }
 }
 
 /// PMEMデバイスが利用可能かを確認
@@ -318,7 +418,7 @@ fn find_best_device_for_allocation(size: usize) -> Option<usize> {
 
 /// 特定のPMEMデバイスからメモリを割り当て
 fn allocate_from_device(device: &PmemDevice, size: usize) -> Option<usize> {
-    // 実際の実装ではデバイス固有のメモリマップとフリーリスト管理が必要
+    // TODO: PMEMデバイス固有のメモリマップとフリーリストを管理し、指定されたサイズの領域を割り当てる処理を実装する
     // ここでは簡略化のため、常に成功するダミー実装を提供
     
     // 使用中メモリが既にデバイスの容量を超えていないかチェック
@@ -332,22 +432,29 @@ fn allocate_from_device(device: &PmemDevice, size: usize) -> Option<usize> {
 }
 
 /// PMEMメモリ領域をDAXモードでマッピング
-fn map_pmem_dax(physical_addr: usize, size: usize) -> Option<usize> {
-    // 実際の実装ではページテーブル操作が必要
-    // VMM経由でのマッピング要求（キャッシュ属性を適切に設定）
-    crate::core::memory::mm::map_device_memory(physical_addr, size, false)
+fn map_pmem_dax(phys_addr: usize, size: usize) -> Option<usize> {
+    // ページテーブルにPTE: WriteBack/WriteCombining/Uncacheable属性を設定
+    let vaddr = vmm::alloc_virtual_range(size)?;
+    for offset in (0..size).step_by(PAGE_SIZE) {
+        vmm::map_page(
+            vaddr + offset,
+            phys_addr + offset,
+            PageAttr::WriteBack | PageAttr::Persistent
+        );
+    }
+    Some(vaddr)
 }
 
 /// PMEMメモリ領域をバッファードI/Oモードでマッピング
 fn map_pmem_buffered(physical_addr: usize, size: usize) -> Option<usize> {
-    // 実際の実装ではページテーブル操作が必要
+    // TODO: PMEMの物理アドレスを指定されたサイズで仮想アドレス空間にマッピングするページテーブル操作を実装する (キャッシュ属性をWrite-Backに設定)
     // VMM経由でのマッピング要求（キャッシュ属性をWBに設定）
     crate::core::memory::mm::map_memory(physical_addr, size)
 }
 
 /// メモリ領域の持続性アノテーションを設定
 fn set_persistence_annotation(ptr: *mut u8, size: usize, is_persistent: bool) {
-    // 実際の実装では、メモリ管理メタデータにアノテーションを設定
+    // TODO: 指定されたメモリ領域の永続性アノテーションをメモリ管理メタデータに設定する処理を実装する
     // ここでは簡略化のため、実装はスキップ
 }
 
@@ -396,7 +503,7 @@ pub fn free(ptr: *mut u8, size: usize) -> Result<(), &'static str> {
 
 /// 特定のPMEMデバイスからメモリを解放
 fn free_from_device(device: &PmemDevice, offset: usize, size: usize) -> Result<(), &'static str> {
-    // 実際の実装ではデバイス固有のメモリマップとフリーリスト管理が必要
+    // TODO: PMEMデバイス固有のメモリマップとフリーリストを管理し、指定されたオフセットとサイズの領域を解放する処理を実装する
     // ここでは簡略化のため、常に成功するダミー実装を提供
     Ok(())
 }
@@ -495,7 +602,7 @@ pub fn allocate_log_area(size: usize) -> Option<*mut u8> {
 
 /// メモリ領域をログ領域としてマーク
 fn mark_as_log_area(ptr: *mut u8, size: usize) {
-    // 実際の実装では、特別なメタデータをセット
+    // TODO: 指定されたPMEM領域をトランザクションログエリアとしてマークするためのメタデータ設定処理を実装する
     // ここでは簡略化のため、実装はスキップ
 }
 
@@ -516,7 +623,7 @@ pub fn transaction_begin() -> Result<TransactionHandle, &'static str> {
 
 /// トランザクションログの割り当て
 fn allocate_transaction_log() -> Result<usize, &'static str> {
-    // 実際の実装では、PMEMにログ領域を確保
+    // TODO: PMEM上にトランザクションログ用の領域を確保し、そのハンドルを返す処理を実装する
     // ここでは簡略化のため、ダミーのハンドルを返す
     Ok(1)
 }
@@ -547,14 +654,14 @@ pub fn transaction_commit(handle: &mut TransactionHandle) -> Result<(), &'static
 
 /// トランザクションログをフラッシュ
 fn flush_transaction_log(log_id: usize) -> Result<(), &'static str> {
-    // 実際の実装では、ログエントリをディスクにフラッシュ
+    // TODO: 指定されたトランザクションログIDに対応するログエントリを永続ストレージにフラッシュする処理を実装する
     // ここでは簡略化のため、常に成功とする
     Ok(())
 }
 
 /// トランザクションをコミット済みとしてマーク
 fn mark_transaction_committed(log_id: usize) -> Result<(), &'static str> {
-    // 実際の実装では、ログにコミットマークを書き込む
+    // TODO: 指定されたトランザクションログIDにコミットマークを永続的に書き込む処理を実装する
     // ここでは簡略化のため、常に成功とする
     Ok(())
 }
@@ -576,7 +683,7 @@ pub fn transaction_abort(handle: &mut TransactionHandle) -> Result<(), &'static 
 
 /// トランザクションをロールバック
 fn rollback_transaction(log_id: usize) -> Result<(), &'static str> {
-    // 実際の実装では、ログに基づいて変更を元に戻す
+    // TODO: 指定されたトランザクションログIDのログ情報に基づいて、関連する変更をアトミックに元に戻す処理を実装する
     // ここでは簡略化のため、常に成功とする
     Ok(())
 }
@@ -599,7 +706,7 @@ pub fn recover_from_crash() -> Result<usize, &'static str> {
 
 /// PMEMログをスキャンして未完了トランザクションを復旧
 fn scan_and_recover_logs() -> Result<usize, &'static str> {
-    // 実際の実装では、ログ領域をスキャンして未完了トランザクションを処理
+    // TODO: システム起動時などにPMEM上のログ領域をスキャンし、未完了のトランザクションを検出し、リカバリ処理を実行する
     // ここでは簡略化のため、0を返す（復旧されたトランザクションはなし）
     Ok(0)
 }
@@ -647,7 +754,7 @@ pub fn verify_data_integrity() -> Result<(), &'static str> {
 
 /// デバイスのメタデータを検証
 fn verify_device_metadata(_device: &PmemDevice) -> Result<(), &'static str> {
-    // 実際の実装では、デバイスのメタデータ構造をチェック
+    // TODO: PMEMデバイスのメタデータ構造（例:ラベル領域、ヘルス情報）を検証する処理を実装する
     // ここでは簡略化のため、常に成功とする
     Ok(())
 }

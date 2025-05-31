@@ -7,6 +7,7 @@ use crate::core::memory::mm::page::{PhysAddr, VirtAddr, PageAllocator, AllocFlag
 use crate::core::memory::mm::vma::{VmaManager, Vma, VmaPerm, VmaType};
 use crate::core::sync::mutex::Mutex;
 use crate::core::sync::rwlock::RwLock;
+use crate::core::network::transport as network;
 
 /// テレページエラー
 #[derive(Debug)]
@@ -286,40 +287,21 @@ impl TelePageManager {
         size: usize,
         page_table: &mut PageTable,
     ) -> Result<(), TelePageError> {
-        // 実際の実装はハードウェアとネットワークプロトコルに依存します
-        // ここではシミュレーションとして、各テレページに対応するローカルページを割り当て
+        // ネットワーク通信でリモートメモリアクセスを設定
+        // リモートノードとの通信にはネットワーク層APIが必要
+        // 依存関係: core::network::transport モジュール
         
-        let num_pages = size / PAGE_SIZE;
-        let page_allocator = PageAllocator::get_instance();
+        let network_result = network::setup_remote_memory_mapping(
+            node_id,
+            remote_phys_addr.as_u64(),
+            local_virt_addr.as_u64(),
+            size
+        );
         
-        for i in 0..num_pages {
-            let local_addr = VirtAddr::new(local_virt_addr.as_usize() + i * PAGE_SIZE);
-            
-            // テレページ用のローカルページを割り当て
-            let phys_page = page_allocator.alloc_pages(1, AllocFlags::NONE)
-                .ok_or(TelePageError::OutOfMemory)?;
-                
-            // 初期データをリモートから取得（シミュレーション）
-            let remote_data = self.fetch_remote_page(
-                node_id,
-                PhysAddr::new(remote_phys_addr.as_usize() + i * PAGE_SIZE),
-            )?;
-            
-            // ローカルページに初期データをコピー
-            unsafe {
-                let dest = phys_page.as_usize() as *mut u8;
-                core::ptr::copy_nonoverlapping(remote_data.as_ptr(), dest, PAGE_SIZE);
-            }
-            
-            // ページをマッピング
-            page_table.map(
-                local_addr,
-                phys_page,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL,
-            ).map_err(|_| TelePageError::PageTableError)?;
+        match network_result {
+            Ok(_) => Ok(()),
+            Err(_) => Err(TelePageError::RemoteMemoryAccessError),
         }
-        
-        Ok(())
     }
 
     /// リモートメモリアクセスの解除
@@ -358,10 +340,17 @@ impl TelePageManager {
 
     /// リモートページからデータを取得（シミュレーション）
     fn fetch_remote_page(&self, node_id: usize, remote_addr: PhysAddr) -> Result<&[u8], TelePageError> {
-        // 実際の実装ではネットワーク経由でリモートからデータを取得
-        // シミュレーションとしてダミーデータを返す
-        static DUMMY_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        Ok(&DUMMY_PAGE)
+        // TODO: ネットワークスタックを介して `node_id` の `remote_addr` からページデータを取得する。
+        //       受信したデータをローカルのバッファに格納し、そのスライスを返す。
+        //       タイムアウト処理やエラーハンドリングが必要。
+        log::info!(
+            "TelePage: Simulating fetching remote page from node {} addr {:?}. (Not actually fetching over network)",
+            node_id, remote_addr
+        );
+        // ダミーデータを返すシミュレーション
+        // このバッファは呼び出し元がコピーして使用することを想定。ライフタイムに注意。
+        let data = self.get_dummy_page_content(node_id, remote_addr);
+        Ok(data)
     }
 
     /// リモートページにデータを書き戻し（シミュレーション）
@@ -371,8 +360,13 @@ impl TelePageManager {
         remote_addr: PhysAddr,
         local_phys_addr: PhysAddr,
     ) -> Result<(), TelePageError> {
-        // 実際の実装ではネットワーク経由でリモートにデータを送信
-        // シミュレーションとして常に成功を返す
+        // TODO: ネットワークスタックを介して `data` (ダーティページの内容) を
+        //       `original_node_id` の `original_physical_address` に書き戻す。
+        //       エラーハンドリングや確認応答メカニズムが必要。
+        log::info!(
+            "TelePage: Simulating writing back TelePage {:?} to node {}. (Not actually writing over network)",
+            telepage_id, original_node_id
+        );
         Ok(())
     }
 

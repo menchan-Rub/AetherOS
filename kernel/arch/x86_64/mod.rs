@@ -3,10 +3,10 @@
 // x86_64アーキテクチャ固有の機能を実装します。
 
 pub mod boot;       // ブート関連コード
-pub mod mm;         // メモリ管理
-pub mod interrupts; // 割り込み管理
-pub mod debug;      // デバッグサポート
 pub mod cpu;        // CPU固有コード
+pub mod interrupts; // 割り込み管理
+pub mod mm;         // メモリ管理
+pub mod debug;      // デバッグサポート
 pub mod acpi;       // ACPIサポート
 pub mod pci;        // PCIバスサポート
 pub mod io;         // I/Oポートアクセス
@@ -20,6 +20,28 @@ pub mod syscall;    // システムコール実装
 
 use crate::arch::ThreadContext;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::arch::ArchInit;
+
+/// x86_64 XSAVE Area (FPU/SIMD/AVX状態保存用)
+/// Intel SDM Vol 1, Chapter 13 XSAVE Feature Set
+/// 少なくとも512バイトが必要（XSAVE Legacy Region）。AVX有効時はさらに256バイト。
+/// AVX-512有効時はさらに大きな領域が必要になる。
+/// ここでは基本的なXSAVE Legacy + AVX (FXSAVE + YMMH) を想定し、
+/// 512 (FXSAVE) + 256 (YMM_Hi128 * 16 / 16) = 768バイト。
+/// しかし、アライメントや将来の拡張性を考慮し、余裕を持ったサイズにするか、
+/// CPUIDで必要なサイズを確認して動的に確保するのが望ましい。
+/// 一旦、固定サイズで定義するが、実際にはcpuidで確認したサイズに基づき確保すべき。
+#[repr(C, align(64))] // XSAVE Areaは64バイトアライメントが必要
+pub struct XSaveArea {
+    data: [u8; 1024], // サイズは将来の拡張やAVX512も考慮して余裕を持たせる (例: 1024)
+    // cpuid.(eax=0xD,ecx=0):ebx で必要なサイズを取得できる
+}
+
+impl Default for XSaveArea {
+    fn default() -> Self {
+        XSaveArea { data: [0; 1024] }
+    }
+}
 
 /// CPU状態構造体
 #[repr(C)]
@@ -52,10 +74,10 @@ pub struct CpuState {
     /// スタックセグメント
     pub ss: u64,
     
-    /// FPU/SIMD状態（512バイトアライメント要）
-    /// 実際の実装ではここにxsaveエリアが配置される
-    /// アライメントの問題を回避するために、ここでは代わりにポインタを使用
-    pub fpu_state: *mut u8,
+    /// FPU/SIMD/AVX状態（XSAVEエリア）
+    /// 64バイトアライメントで確保されたXSAVE/FXSAVE互換領域へのポインタ。
+    /// CPUID経由で必要なサイズを確認し、適切に割り当てる必要がある。
+    xsave_area: *mut XSaveArea,
 }
 
 /// スレッドコンテキスト
@@ -78,10 +100,10 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 pub fn init() {
     // サブモジュールの初期化
     boot::init();
-    mm::init();
-    debug::init();
-    interrupts::init();
     cpu::init();
+    interrupts::init();
+    mm::init_memory(); 
+    debug::init();
     acpi::init();
     pci::init();
     io::init();
@@ -93,17 +115,15 @@ pub fn init() {
     vmm::init();
     syscall::init();
     
-    // CPUコア数の検出と設定
     let cpu_count = detect_cpu_count();
     CPU_COUNT.store(cpu_count, Ordering::SeqCst);
     
-    log::info!("x86_64アーキテクチャ初期化完了: {}コア検出", cpu_count);
+    // シリアル出力には crate::core::debug::serial_println を使用
+    crate::core::debug::serial_println!("x86_64アーキテクチャ初期化完了: {}コア検出", cpu_count);
 }
 
 /// CPUコア数を検出
 fn detect_cpu_count() -> usize {
-    // ACPIからCPUコア数を検出
-    // ここでは簡略化のため、単一コアを想定
     acpi::get_cpu_count().unwrap_or(1)
 }
 
@@ -114,8 +134,6 @@ pub fn get_cpu_count() -> usize {
 
 /// 現在のCPU IDを取得
 pub fn get_current_cpu_id() -> usize {
-    // APICからCPU IDを取得
-    // ブートストラップ段階では0を返す
     apic::get_current_cpu_id().unwrap_or(0)
 }
 
@@ -152,54 +170,43 @@ pub fn set_timer_handler(handler: fn()) {
 
 /// 初期スレッドスイッチ
 pub fn first_thread_switch(stack_top: usize) {
-    // アセンブリでスタックをセットして最初のスレッドにジャンプ
     unsafe {
-        // スタックポインタを設定してretを実行
-        // これにより、スタックの先頭に格納されたアドレスにジャンプする
         core::arch::asm!(
             "mov rsp, {}",
-            "xor rbp, rbp", // ベースポインタをクリア
-            "ret",          // スタックからリターンアドレスをポップしてジャンプ
+            "xor rbp, rbp", 
+            "ret",          
             in(reg) stack_top,
             options(noreturn)
         );
     }
 }
 
-/// コンテキストスイッチ
+/// 現在のスレッドコンテキストを保存し、次のスレッドコンテキストを復元
 pub fn context_switch(current: *mut ThreadContext, next: *mut ThreadContext) {
     unsafe {
-        // 現在のRSPを保存し、次のRSPをロード
-        // 実際の実装では、さらに多くのレジスタを保存/復元する必要がある
-        let current_impl = current as *mut ThreadContextImpl;
-        let next_impl = next as *mut ThreadContextImpl;
-        
-        core::arch::asm!(
-            // 現在のコンテキストを保存
-            "push rbp",
-            "push rbx",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            
-            // 現在のRSPを保存
-            "mov [{}], rsp",
-            
-            // 次のRSPをロード
-            "mov rsp, [{}]",
-            
-            // 次のコンテキストを復元
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbx",
-            "pop rbp",
-            
-            in(reg) &(*current_impl).kernel_rsp,
-            in(reg) &(*next_impl).kernel_rsp,
-            options(preserves_flags)
-        );
+        core::hint::spin_loop(); 
+    }
+}
+
+/// アイドル状態。割り込みを待ち続ける。
+pub fn idle() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("sti"); 
+            core::arch::asm!("hlt"); 
+            core::arch::asm!("cli"); 
+        }
+    }
+}
+
+pub struct x86_64;
+
+impl ArchInit for x86_64 {
+    fn init() {
+        self::init(); 
+    }
+
+    fn idle() -> ! {
+        self::idle(); 
     }
 } 

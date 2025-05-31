@@ -19,6 +19,38 @@ use alloc::vec::Vec;
 use alloc::string::{String, ToString};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use log::{debug, info, warn, error, trace};
+use crate::core::memory::PageSize;
+use crate::core::memory::buddy::BuddyAllocator;
+
+/// ブートローダーから渡される情報 (仮定義)
+#[derive(Debug, Clone, Copy)]
+pub struct BootInfo {
+    pub memory_map_addr: usize,
+    pub memory_map_len: usize,
+    // 他のブート情報（例：ACPI RSDPポインタ、カーネルコマンドラインなど）
+}
+
+/// メモリマップエントリ構造体 (仮定義、E820等を模倣)
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct MemoryMapEntry {
+    pub base_addr: u64,
+    pub length: u64,
+    /// メモリタイプ (例: 1 = Usable RAM, その他 = Reserved, ACPI, NVSなど)
+    pub entry_type: u32,
+    /// ACPI 3.0+ 拡張属性
+    pub acpi_extended_attributes: u32,
+}
+
+// 仮のグローバル変数 (実際にはブートローダーがカーネルエントリ時に設定する)
+// これは設計として理想的ではないが、関数のシグネチャを変更せずに
+// parse_memory_map 内で情報を受け取るための一時的な手段。
+static mut GLOBAL_BOOT_INFO: Option<BootInfo> = None;
+
+/// ブート情報を設定する (カーネル初期化の最初期に呼び出される想定)
+pub unsafe fn set_global_boot_info(boot_info: BootInfo) {
+    GLOBAL_BOOT_INFO = Some(boot_info);
+}
 
 /// 不揮発性メモリのデータ永続化モード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +393,9 @@ impl PmemManager {
         self.check_pmem_address(addr, size)?;
         
         // メモリをフラッシュ
-        // 実際の実装では、CACHECLFLUSHやclflushopmなどの命令を使用
+        // TODO: アーキテクチャ固有のキャッシュフラッシュ命令 (例: CLFLUSH, CLFLUSHOPT, DC CIVAC) を使用して
+        //       指定されたメモリアドレス範囲 (`start_line` から `end_addr` まで) をキャッシュからフラッシュする。
+        //       `arch::pmem_flush_cache_range(start_line, end_addr - start_line);` のようなヘルパー関数を想定。
         unsafe {
             self.flush_pmem_range(addr, size);
         }
@@ -378,9 +412,11 @@ impl PmemManager {
         }
         
         // メモリバリアを実行
-        // 実際の実装では、SFENCEやMFENCE命令を使用
+        // TODO: アーキテクチャ固有のメモリバリア命令 (例: SFENCE, MFENCE, DSB ISH) を実行して、
+        //       フラッシュ操作が完了するのを保証する。
+        //       `arch::pmem_memory_barrier();` のようなヘルパー関数を想定。
         unsafe {
-            self.pmem_sfence();
+            arch::asm::sfence();
         }
         
         trace!("PMEMメモリバリア実行");
@@ -406,28 +442,133 @@ impl PmemManager {
     
     /// PMEM領域をフラッシュ（低レベル操作）
     unsafe fn flush_pmem_range(&self, addr: usize, size: usize) {
-        // アラインメントと最適なフラッシュ方法を考慮
-        // 実際の実装では、clflush/clflushopt/clwbなどの命令を使用
-        
-        // 簡易実装
-        let ptr = addr as *const u8;
-        let cache_line_size = 64; // 一般的なキャッシュラインサイズ
-        
-        for offset in (0..size).step_by(cache_line_size) {
-            let line_ptr = ptr.add(offset);
-            // clflushopt相当の命令を実行（アーキテクチャ依存）
-            // ここではダミー実装
-        }
-        
-        // メモリフェンス（SFENCE相当）を実行
-        self.pmem_sfence();
+        // TODO: この関数は `flush_pmem_range_internal` を使用するか、あるいは直接
+        //       アーキテクチャ固有のキャッシュフラッシュ命令とメモリバリアを呼び出す。
+        //       `arch::pmem_flush_cache_range(addr, size);`
+        //       `arch::pmem_memory_barrier();`
+        //       のようなヘルパー関数を呼び出すことを想定。
+        //       以下の実装はx86_64の例であり、アーキテクチャ中立な実装が必要。
+        log::trace!("Flushing PMEM range: addr={:#x}, size={}", addr, size);
+        self.flush_pmem_range_internal(addr, size);
     }
     
-    /// PMEMストアフェンス（低レベル操作）
-    unsafe fn pmem_sfence(&self) {
-        // SFENCEまたは同等の命令を実行
-        // ここではダミー実装
-        core::sync::atomic::fence(Ordering::SeqCst);
+    fn flush_pmem_range_internal(&self, addr: usize, size: usize) {
+        let start_line = addr & !(CACHE_LINE_SIZE - 1);
+        let end_addr = addr + size;
+
+        // アーキテクチャ固有のキャッシュフラッシュ命令を使用
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe {
+                let mut current_addr = start_line;
+                while current_addr < end_addr {
+                    // CLFLUSHOPT命令を使用（利用可能な場合）
+                    if self.has_clflushopt() {
+                        core::arch::asm!(
+                            "clflushopt ({})",
+                            in(reg) current_addr,
+                            options(nostack, preserves_flags)
+                        );
+                    } else {
+                        // フォールバック：CLFLUSH命令
+                        core::arch::asm!(
+                            "clflush ({})",
+                            in(reg) current_addr,
+                            options(nostack, preserves_flags)
+                        );
+                    }
+                    current_addr += CACHE_LINE_SIZE;
+                }
+                
+                // SFENCE命令でメモリバリアを実行
+                core::arch::asm!("sfence", options(nostack, preserves_flags));
+            }
+        }
+        
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                let mut current_addr = start_line;
+                while current_addr < end_addr {
+                    // DC CIVAC命令（Clean and Invalidate by VA to PoC）
+                    core::arch::asm!(
+                        "dc civac, {}",
+                        in(reg) current_addr,
+                        options(nostack, preserves_flags)
+                    );
+                    current_addr += CACHE_LINE_SIZE;
+                }
+                
+                // DSB ISH命令でメモリバリアを実行
+                core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+            }
+        }
+        
+        #[cfg(target_arch = "riscv64")]
+        {
+            unsafe {
+                // RISC-V: FENCE命令でメモリバリアを実行
+                // キャッシュフラッシュ命令は標準化されていないため、
+                // システム固有の実装が必要
+                core::arch::asm!(
+                    "fence rw,rw",
+                    options(nostack, preserves_flags)
+                );
+                
+                // 可能であればCBO（Cache Block Operations）拡張を使用
+                if self.has_cbo_extension() {
+                    let mut current_addr = start_line;
+                    while current_addr < end_addr {
+                        // CBO.FLUSH命令（利用可能な場合）
+                        core::arch::asm!(
+                            ".insn r 0x0F, 0x2, 0x00, x0, {}, x0",
+                            in(reg) current_addr,
+                            options(nostack, preserves_flags)
+                        );
+                        current_addr += CACHE_LINE_SIZE;
+                    }
+                }
+            }
+        }
+        
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+        {
+            // 他のアーキテクチャ：汎用的なメモリバリア
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            log::warn!("アーキテクチャ固有のキャッシュフラッシュ命令が利用できません");
+        }
+    }
+    
+    /// CLFLUSHOPT命令が利用可能かチェック
+    #[cfg(target_arch = "x86_64")]
+    fn has_clflushopt(&self) -> bool {
+        // CPUID命令でCLFLUSHOPT対応をチェック
+        unsafe {
+            let mut eax: u32;
+            let mut ebx: u32;
+            let mut ecx: u32;
+            let mut edx: u32;
+            
+            // CPUID.07H:EBX.CLFLUSHOPT[bit 23]
+            core::arch::asm!(
+                "cpuid",
+                inout("eax") 0x07u32 => eax,
+                inout("ebx") 0u32 => ebx,
+                inout("ecx") 0u32 => ecx,
+                inout("edx") 0u32 => edx,
+                options(nostack, preserves_flags)
+            );
+            
+            (ebx & (1 << 23)) != 0
+        }
+    }
+    
+    /// CBO拡張が利用可能かチェック
+    #[cfg(target_arch = "riscv64")]
+    fn has_cbo_extension(&self) -> bool {
+        // RISC-V ISA文字列またはデバイスツリーから確認
+        // 簡略化実装：常にfalseを返す
+        false
     }
     
     /// 現在時間を取得（起動からの秒数）
@@ -554,4 +695,127 @@ pub fn init() -> Result<(), &'static str> {
     let _ = api::init_pmem().map_err(|_| "PMEM APIの初期化に失敗")?;
     
     Ok(())
+}
+
+const MAX_MEMORY_REGIONS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryRegion {
+    pub start: usize,
+    pub size: usize,
+    pub available: bool,
+}
+
+pub struct PhysicalMemoryManager {
+    memory_regions: [Option<MemoryRegion>; MAX_MEMORY_REGIONS],
+    region_count: usize,
+    buddy_allocator: BuddyAllocator,
+    total_memory: usize,
+    free_memory: usize,
+}
+
+impl PhysicalMemoryManager {
+    pub fn new() -> Self {
+        Self {
+            memory_regions: [None; MAX_MEMORY_REGIONS],
+            region_count: 0,
+            buddy_allocator: BuddyAllocator::new(),
+            total_memory: 0,
+            free_memory: 0,
+        }
+    }
+    
+    pub fn init(&mut self) {
+        // ブートローダーが提供したメモリマップを解析
+        // ブートローダー（UEFI/BIOS）からの情報を取得し、
+        // PMEMデバイスタイプ（NVDIMM、3D XPoint等）を識別
+        // ACPI NFITテーブルも参照してPMEM領域を特定
+        
+        unsafe {
+            if let Some(boot_info) = GLOBAL_BOOT_INFO.as_ref() {
+                self.parse_acpi_nfit_table(boot_info)?;
+                self.scan_memory_map_for_pmem(boot_info)?;
+            } else {
+                return Err("ブート情報が設定されていません");
+            }
+        }
+        
+        // バディアロケータを初期化
+        self.init_buddy_allocator();
+    }
+    
+    fn parse_acpi_nfit_table(&self, boot_info: &BootInfo) -> Result<(), &'static str> {
+        // 実装は後で追加
+        Ok(())
+    }
+    
+    fn scan_memory_map_for_pmem(&self, boot_info: &BootInfo) -> Result<(), &'static str> {
+        // 実装は後で追加
+        Ok(())
+    }
+    
+    fn add_memory_region(&mut self, start: usize, size: usize, available: bool) -> bool {
+        if self.region_count >= MAX_MEMORY_REGIONS {
+            return false;
+        }
+        
+        let region = MemoryRegion {
+            start,
+            size,
+            available,
+        };
+        
+        self.memory_regions[self.region_count] = Some(region);
+        self.region_count += 1;
+        
+        true
+    }
+    
+    fn calculate_memory_totals(&mut self) {
+        self.total_memory = 0;
+        self.free_memory = 0;
+        
+        for i in 0..self.region_count {
+            if let Some(region) = self.memory_regions[i] {
+                self.total_memory += region.size;
+                
+                if region.available {
+                    self.free_memory += region.size;
+                }
+            }
+        }
+    }
+    
+    fn init_buddy_allocator(&mut self) {
+        // 利用可能なメモリ領域をバディアロケータに追加
+        let mut available_regions = Vec::new();
+        
+        for i in 0..self.region_count {
+            if let Some(region) = self.memory_regions[i] {
+                if region.available {
+                    available_regions.push(region);
+                }
+            }
+        }
+        
+        self.buddy_allocator.init(available_regions);
+    }
+    
+    pub fn allocate_page(&mut self, size: PageSize) -> Option<usize> {
+        let bytes = size.bytes();
+        self.buddy_allocator.allocate(bytes)
+    }
+    
+    pub fn free_page(&mut self, addr: usize, size: PageSize) {
+        let bytes = size.bytes();
+        self.buddy_allocator.free(addr, bytes);
+    }
+    
+    pub fn get_total_memory(&self) -> usize {
+        self.total_memory
+    }
+    
+    pub fn get_free_memory(&self) -> usize {
+        self.free_memory
+    }
 } 

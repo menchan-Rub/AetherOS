@@ -12,7 +12,7 @@ use crate::core::memory::mm::slub::api as slub_api;
 use crate::core::process::Process;
 use crate::fs::FileDescriptor;
 use alloc::vec::Vec;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, warn, trace};
 use spin::Mutex;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -21,6 +21,11 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::core::sync::RwLock;
 use crate::core::memory::mm::slab::SlabCache;
+use crate::core::fs::vfs;
+use crate::core::fs::ext4::Ext4FileSystem;
+use crate::core::fs::fat32::Fat32FileSystem;
+use crate::core::fs::ntfs::NtfsFileSystem;
+use core::sync::Once;
 
 /// メモリマッピングの保護フラグ
 pub mod prot {
@@ -408,65 +413,94 @@ fn handle_file_fault(
     vma: &VirtualMemoryArea,
     fault_addr: VirtualAddress,
 ) -> bool {
-    let page_size = PageSize::Default;
-    let page_size_bytes = page_size as usize;
-    let aligned_addr = fault_addr & !(page_size_bytes - 1);
-    
-    // VMA内のオフセットを計算
-    let vma_offset = aligned_addr - vma.range.start;
-    let file_offset = vma.file_offset + vma_offset;
-    
+    let page_size = PageSize::Default as usize;
+    // フォルトアドレスをページ境界にアライン
+    let page_addr = fault_addr & !(page_size - 1);
+
+    // VMA 内のページオフセットを計算
+    let page_offset_in_vma = page_addr.as_usize().saturating_sub(vma.range.start.as_usize());
+
+    // ファイル内の読み込み開始オフセットを計算
+    let file_read_offset = vma.file_offset + page_offset_in_vma;
+
     // ファイルディスクリプタを取得
-    let fd = match &vma.file_descriptor {
-        Some(fd) => fd,
+    let fd = match vma.file_descriptor {
+        Some(ref fd_ref) => fd_ref,
         None => {
-            error!("handle_file_fault: ファイルディスクリプタが無効です");
+            error!("handle_file_fault: VMA にファイルディスクリプタがありません: {:#x}", fault_addr);
+            return false;
+        }
+    };
+
+    // 物理ページを割り当て
+    let phys_addr = match page_api::alloc_pages(1) {
+        Some(p) => p,
+        None => {
+            error!("handle_file_fault: 物理ページの割り当てに失敗しました: {:#x}", fault_addr);
+            return false;
+        }
+    };
+
+    // 物理ページを一時的にマップしてファイルデータを読み込むバッファを取得
+    // (カーネル空間にマップするなど、安全な方法で物理ページにアクセスする)
+    // ここでは、物理アドレスを直接ポインタにキャストする代わりに、
+    // 一時的なカーネルマッピングを作成するAPIの呼び出しを想定 (例: mm::map_physical_page_to_kernel_temp)
+    // もしそのようなAPIがなければ、物理ページを指す可変スライスを安全に取得する方法が必要。
+    // 以下は簡略化のため、物理アドレスを直接使っているように見えますが、実際にはより安全な方法が必要です。
+    let temp_kernel_mapping = match paging::map_temporary_page(phys_addr, page_size) {
+        Ok(ptr) => ptr as *mut u8,
+        Err(_) => {
+            error!("handle_file_fault: 物理ページの一時マッピングに失敗: {:#x}", phys_addr);
+            page_api::free_pages(phys_addr, 1);
             return false;
         }
     };
     
-    // 物理ページを割り当て
-    if let Some(phys_addr) = page_api::alloc_pages(1) {
-        // ファイルからデータを読み込む
-        let buffer = phys_addr as *mut u8;
-        let bytes_read = fd.read_at(file_offset, unsafe { core::slice::from_raw_parts_mut(buffer, page_size_bytes) });
-        
-        if bytes_read > 0 {
-            // 未使用部分をゼロクリア
-            if bytes_read < page_size_bytes {
-                unsafe {
-                    for i in bytes_read..page_size_bytes {
-                        buffer.add(i).write_volatile(0);
-                    }
+    let buffer = unsafe { core::slice::from_raw_parts_mut(temp_kernel_mapping, page_size) };
+
+    // ファイルシステムからデータをロード
+    match fd.read_at(buffer, file_read_offset) {
+        Ok(bytes_read) => {
+            if bytes_read < page_size {
+                // ファイルの終端に達した場合、残りのバッファをゼロクリア
+                for i in bytes_read..page_size {
+                    buffer[i] = 0;
                 }
             }
-            
-            // マッピングを作成
-            if paging::map_pages(
-                page_table.get_root(),
-                aligned_addr,
-                phys_addr,
-                1,
-                page_size,
-                vma.permissions,
-            ) {
-                debug!("handle_file_fault: ファイルページをマッピングしました: vaddr={:#x}, paddr={:#x}, offset={}", 
-                      aligned_addr, phys_addr, file_offset);
-                return true;
-            } else {
-                error!("handle_file_fault: ページマッピングに失敗しました: vaddr={:#x}", aligned_addr);
-            }
-        } else {
-            error!("handle_file_fault: ファイルの読み込みに失敗しました: offset={}", file_offset);
+            // 読み込み成功
         }
-        
-        // 失敗した場合は物理ページを解放
-        page_api::free_pages(phys_addr, 1);
-    } else {
-        error!("handle_file_fault: 物理ページの割り当てに失敗しました");
+        Err(e) => {
+            error!("handle_file_fault: ファイルデータの読み込みに失敗しました: {:?}, offset={}", e, file_read_offset);
+            paging::unmap_temporary_page(temp_kernel_mapping as usize, page_size); // 一時マッピングを解除
+            page_api::free_pages(phys_addr, 1);
+            return false;
+        }
     }
     
-    false
+    // 一時マッピングを解除
+    paging::unmap_temporary_page(temp_kernel_mapping as usize, page_size);
+
+    // ページテーブルに新しいマッピングを作成
+    if !paging::map_pages(
+        page_table.get_root(),
+        page_addr, // フォルトしたページのアドレス
+        phys_addr, // 割り当てた物理ページ
+        1,         // ページ数
+        PageSize::Default,
+        vma.permissions, // VMAの権限を使用
+    ) {
+        error!("handle_file_fault: ページのマッピングに失敗しました: vaddr={:#x}, paddr={:#x}", page_addr, phys_addr);
+        page_api::free_pages(phys_addr, 1);
+        return false;
+    }
+
+    debug!(
+        "File fault handled: mapped {:#x} -> {:#x} (file offset {})",
+        page_addr.as_usize(),
+        phys_addr.as_usize(),
+        file_read_offset
+    );
+    true
 }
 
 /// VMAタイプを決定
@@ -1664,16 +1698,41 @@ impl AddressSpace {
                 
                 // ファイルシステムからデータをロード（実際の実装はファイルシステムモジュールに依存）
                 let page_offset_in_file = (page_addr.as_usize() - vma.start.as_usize()) + offset;
-                load_file_data(*file_id, page_offset_in_file, page.phys_addr())?;
+                let mut page_data = vec![0u8; PAGE_SIZE]; // ページサイズのバッファ
                 
-                // ページテーブルにマップ
-                let mut page_table = self.page_table.lock();
-                page_table.map(
-                    page_addr,
-                    page.phys_addr(),
-                    PageSize::Size4KiB,
-                    convert_to_arch_permissions(vma.permissions),
-                )?;
+                // ファイルシステムマネージャーからファイルを読み込み
+                let bytes_read = match self.read_file_data_with_caching(file_id, page_offset_in_file, &mut page_data) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        log::error!("ファイルページ読み込み失敗: {:?}", e);
+                        return Err(MmapError::FileError);
+                    }
+                };
+                
+                // ページにデータをコピー
+                unsafe {
+                    let page_ptr = page.phys_addr().as_mut_ptr::<u8>();
+                    core::ptr::copy_nonoverlapping(
+                        page_data.as_ptr(), 
+                        page_ptr, 
+                        core::cmp::min(bytes_read, PAGE_SIZE)
+                    );
+                    
+                    // 残りの部分をゼロ埋め
+                    if bytes_read < PAGE_SIZE {
+                        core::ptr::write_bytes(
+                            page_ptr.add(bytes_read), 
+                            0, 
+                            PAGE_SIZE - bytes_read
+                        );
+                    }
+                }
+                
+                log::trace!("ファイルページロード完了: VMA=0x{:x}, ページ=0x{:x}, 読み込み={}バイト", 
+                           vma.start.as_usize(), page_addr.as_usize(), bytes_read);
+                
+                // ページをVMAにマッピング
+                self.map_page_to_vma(page_addr, page.phys_addr(), vma.flags)?;
             },
             MapType::Shared { shared_id, offset } => {
                 // 共有メモリからページをロード
@@ -1744,354 +1803,474 @@ impl AddressSpace {
     pub fn id(&self) -> usize {
         self.id
     }
-}
-
-/// メモリマッピングエラー
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MmapError {
-    /// 無効なアドレス
-    InvalidAddress,
-    /// メモリ不足
-    OutOfMemory,
-    /// アドレス競合
-    AddressConflict,
-    /// 権限拒否
-    PermissionDenied,
-    /// 領域が見つからない
-    RegionNotFound,
-    /// 無効なサイズ
-    InvalidSize,
-    /// マッピングエラー
-    MappingError,
-    /// アンマッピングエラー
-    UnmappingError,
-    /// ページテーブルエラー
-    PageTableError,
-    /// ファイル操作エラー
-    FileError,
-    /// 共有メモリエラー
-    SharedMemoryError,
-    /// テレページエラー
-    TelePageError,
-}
-
-// 内部ヘルパー関数
-
-/// パーミッションをアーキテクチャ固有のフォーマットに変換
-fn convert_to_arch_permissions(perms: MapPermissions) -> u64 {
-    // この実装はアーキテクチャによって異なる
-    // ここでは仮の実装
-    let mut result = 0;
     
-    if perms.read {
-        result |= 1;
-    }
-    
-    if perms.write {
-        result |= 2;
-    }
-    
-    if perms.execute {
-        result |= 4;
-    }
-    
-    if perms.user {
-        result |= 8;
-    }
-    
-    if !perms.cacheable {
-        result |= 16;
-    }
-    
-    result
-}
-
-/// ファイルデータをロード（ファイルシステムモジュールに依存）
-fn load_file_data(file_id: usize, offset: usize, dest_phys_addr: PhysAddr) -> Result<(), MmapError> {
-    // ファイルシステム呼び出しの仮実装
-    // 実際の実装ではファイルシステムモジュールを使用
-    
-    // エラー処理例
-    if file_id == 0 {
-        return Err(MmapError::FileError);
-    }
-    
-    // ここでファイルデータをロードする実装
-    
-    Ok(())
-}
-
-/// 共有メモリページを取得
-fn get_shared_memory_page(shared_id: usize, offset: usize) -> Result<PhysAddr, MmapError> {
-    // 共有メモリからページを取得
-    // 実際の実装では共有メモリマネージャーモジュールを使用
-    
-    // 仮実装
-    if shared_id == 0 || offset >= 1024 * 1024 * 1024 {
-        return Err(MmapError::SharedMemoryError);
-    }
-    
-    // 仮の物理アドレスを返す
-    let page = Page::alloc(AllocFlags::NONE)
-        .map_err(|_| MmapError::OutOfMemory)?;
-    
-    Ok(page.phys_addr())
-}
-
-/// テレページをフェッチ
-fn fetch_telepage(node_id: usize, remote_phys_addr: PhysAddr) -> Result<Page, MmapError> {
-    // リモートノードからテレページをフェッチ
-    // 実際の実装ではテレページマネージャーモジュールを使用
-    
-    // 仮実装
-    if node_id == 0 {
-        return Err(MmapError::TelePageError);
-    }
-    
-    // 新しいローカルページを割り当て
-    let page = Page::alloc(AllocFlags::NONE)
-        .map_err(|_| MmapError::OutOfMemory)?;
-    
-    // ここでリモートメモリからデータをフェッチする実装
-    
-    Ok(page)
-}
-
-/// グローバルなVMAキャッシュ
-pub static VMA_CACHE: Mutex<Option<SlabCache>> = Mutex::new(None);
-
-/// メモリマッピングサブシステムを初期化
-pub fn init_mmap() {
-    let mut cache_lock = VMA_CACHE.lock();
-    *cache_lock = Some(SlabCache::new("vma_cache", core::mem::size_of::<VirtualMemoryArea>(), 8));
-}
-
-// グローバルAPI関数
-// これらの関数はカーネル内の他のモジュールから呼び出される
-
-/// 物理メモリ領域を指定アドレスにマップ
-pub fn map_physical(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    phys_addr: PhysAddr,
-    size: usize,
-    permissions: MapPermissions,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        permissions,
-        MapType::Ram { phys_addr },
-    )
-}
-
-/// 匿名メモリ領域を指定アドレスにマップ
-pub fn map_anonymous(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    size: usize,
-    permissions: MapPermissions,
-    zero_on_demand: bool,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        permissions,
-        MapType::Anonymous { zero_on_demand },
-    )
-}
-
-/// デバイスメモリを指定アドレスにマップ
-pub fn map_device(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    phys_addr: PhysAddr,
-    size: usize,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        MapPermissions::device(),
-        MapType::Device { phys_addr },
-    )
-}
-
-/// ファイルを指定アドレスにマップ
-pub fn map_file(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    file_id: usize,
-    offset: usize,
-    size: usize,
-    permissions: MapPermissions,
-    file_perms: FilePermissions,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        permissions,
-        MapType::File {
-            file_id,
-            offset,
-            file_perms,
-        },
-    )
-}
-
-/// 共有メモリを指定アドレスにマップ
-pub fn map_shared(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    shared_id: usize,
-    offset: usize,
-    size: usize,
-    permissions: MapPermissions,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        permissions,
-        MapType::Shared {
-            shared_id,
-            offset,
-        },
-    )
-}
-
-/// テレページを指定アドレスにマップ
-pub fn map_telepage(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    node_id: usize,
-    remote_phys_addr: PhysAddr,
-    size: usize,
-    permissions: MapPermissions,
-) -> Result<VirtAddr, MmapError> {
-    addr_space.map(
-        virt_addr,
-        size,
-        permissions,
-        MapType::TelePage {
-            node_id,
-            remote_phys_addr,
-        },
-    )
-}
-
-/// 指定範囲のメモリをアンマップ
-pub fn unmap(
-    addr_space: &AddressSpace,
-    virt_addr: VirtAddr,
-    size: usize,
-) -> Result<(), MmapError> {
-    addr_space.unmap(virt_addr, size)
-}
-
-/// ページフォルトを処理
-pub fn handle_page_fault(
-    addr_space: &AddressSpace,
-    fault_addr: VirtAddr,
-    write_access: bool,
-    instruction_fetch: bool,
-) -> Result<(), MmapError> {
-    addr_space.handle_page_fault(fault_addr, write_access, instruction_fetch)
-}
-
-/// SLUB支援マッピングの作成
-/// 
-/// SLUBアロケータを使用して小さいオブジェクトを効率的に管理するための
-/// メモリマッピングを作成します。
-/// 
-/// # 引数
-/// * `page_table` - ページテーブル
-/// * `vaddr` - マッピングする仮想アドレス（NULLの場合は自動割り当て）
-/// * `object_size` - 各オブジェクトのサイズ（バイト）
-/// * `alignment` - アラインメント要件（バイト）
-/// * `prot` - 保護フラグ（読み取り/書き込み/実行）
-/// * `flags` - マッピングフラグ
-/// 
-/// # 戻り値
-/// * 成功した場合はマッピング結果、失敗した場合はNone
-pub fn slub_mmap(
-    page_table: &mut PageTable,
-    vaddr: Option<VirtualAddress>,
-    object_size: usize,
-    alignment: usize,
-    count: usize,
-    prot: u32,
-    flags: u32,
-) -> Option<MappingResult> {
-    // サイズが0またはオブジェクト数が0の場合は無効
-    if object_size == 0 || count == 0 {
-        warn!("slub_mmap: オブジェクトサイズまたは数が0のマッピングは無効です");
-        return None;
-    }
-    
-    // SLUBキャッシュ名を生成
-    let cache_name = match object_size {
-        8 => "size-8",
-        16 => "size-16",
-        32 => "size-32",
-        64 => "size-64",
-        128 => "size-128",
-        256 => "size-256",
-        512 => "size-512",
-        1024 => "size-1024",
-        2048 => "size-2048",
-        4096 => "size-4096",
-        _ => {
-            // 標準サイズ以外は独自のキャッシュを作成
-            let custom_name = format!("mmap-{}", object_size);
-            let static_name = Box::leak(custom_name.into_boxed_str());
-            
-            // キャッシュが存在しない場合は作成
-            slub_api::create_cache(static_name, object_size, alignment);
-            static_name
-        }
-    };
-    
-    // 必要なサイズを計算
-    let total_size = object_size * count;
-    let aligned_size = (total_size + page_api::PAGE_SIZE - 1) & !(page_api::PAGE_SIZE - 1);
-    
-    // VMAタイプを決定
-    let vma_type = determine_vma_type(prot, flags);
-    
-    // キャッシュポリシーを決定
-    let cache_policy = determine_cache_policy(flags);
-    
-    // マッピングアドレスを決定
-    let mapping_addr = match vaddr {
-        Some(addr) if flags & flags::FIXED != 0 => {
-            // 固定アドレスの場合、既存のマッピングがあれば解除
-            let aligned_addr = addr & !(page_api::PAGE_SIZE - 1);
-            if unmap(page_table, aligned_addr, aligned_size).is_none() {
-                warn!("slub_mmap: 既存マッピングの解除に失敗しました");
-                return None;
+    /// ファイルからデータを読み込み
+    fn read_file_data(&self, inode_id: usize, offset: usize, buffer: &mut [u8]) -> Result<usize, MmapError> {
+        // ファイルシステムマネージャーからファイルシステムを取得
+        let fs = crate::core::fs::manager::get_filesystem_by_inode_id(inode_id)
+            .ok_or(MmapError::FileError)?;
+        
+        // ファイルからデータを読み込み
+        match fs.read_file_data(inode_id, offset, buffer) {
+            Ok(bytes_read) => {
+                log::trace!("ファイル読み込み成功: inode={}, offset={}, bytes={}", 
+                           inode_id, offset, bytes_read);
+                Ok(bytes_read)
+            },
+            Err(fs_error) => {
+                log::error!("ファイル読み込みエラー: inode={}, error={:?}", inode_id, fs_error);
+                Err(MmapError::FileError)
             }
-            aligned_addr
-        },
-        Some(addr) => {
-            // 推奨アドレスが指定されている場合
-            let aligned_addr = addr & !(page_api::PAGE_SIZE - 1);
-            if vma_api::is_region_free(page_table, aligned_addr, aligned_size) {
+        }
+    }
+
+    /// ファイルからデータを読み込み（キャッシュあり）
+    fn read_file_data_with_caching(&self, file_id: usize, offset: usize, buffer: &mut [u8]) -> Result<usize, MmapError> {
+        // ファイルシステムマネージャーから適切なファイルシステムを取得
+        let filesystem = self.get_filesystem_for_file(file_id)?;
+        
+        // ページアラインされたオフセットであることを確認
+        if offset % PAGE_SIZE != 0 {
+            log::warn!("ページアラインされていないオフセット: {}", offset);
+            return Err(MmapError::InvalidArgument);
+        }
+        
+        // キャッシュチェック
+        if let Some(cached_page) = self.check_file_cache(file_id, offset) {
+            let copy_size = core::cmp::min(buffer.len(), PAGE_SIZE);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    cached_page.as_ptr(),
+                    buffer.as_mut_ptr(),
+                    copy_size
+                );
+            }
+            log::trace!("ファイルデータキャッシュヒット: file_id={}, offset=0x{:x}", file_id, offset);
+            return Ok(copy_size);
+        }
+        
+        // ファイルシステムから実際にデータを読み込み
+        let mut file_buffer = vec![0u8; PAGE_SIZE];
+        let bytes_read = match filesystem.read_file_at_offset(file_id, offset, &mut file_buffer) {
+            Ok(size) => size,
+            Err(e) => {
+                log::error!("ファイル読み込み失敗: file_id={}, offset=0x{:x}, error={:?}", file_id, offset, e);
+                return Err(MmapError::FileError);
+            }
+        };
+        
+        // 読み込んだデータをバッファにコピー
+        let copy_size = core::cmp::min(buffer.len(), bytes_read);
+        buffer[..copy_size].copy_from_slice(&file_buffer[..copy_size]);
+        
+        // キャッシュに保存
+        self.cache_file_data(file_id, offset, &file_buffer[..bytes_read]);
+        
+        log::trace!("ファイルデータ読み込み完了: file_id={}, offset=0x{:x}, size={}", 
+                   file_id, offset, bytes_read);
+        
+        Ok(copy_size)
+    }
+    
+    fn get_filesystem_for_file(&self, file_id: usize) -> Result<Arc<dyn FileSystem>, MmapError> {
+        // ファイルディスクリプタテーブルからファイルシステムを特定
+        let fd_table = crate::core::fs::manager::get_file_descriptor_table()
+            .ok_or(MmapError::FileError)?;
+        
+        let file_info = fd_table.get_file_info(file_id)
+            .ok_or(MmapError::FileError)?;
+        
+        match file_info.filesystem_type {
+            FilesystemType::Ext4 => {
+                let ext4_fs = crate::core::fs::ext4::Ext4FileSystem::new(file_info.device_id)
+                    .map_err(|_| MmapError::FileError)?;
+                Ok(Arc::new(ext4_fs))
+            },
+            FilesystemType::Fat32 => {
+                let fat32_fs = crate::core::fs::fat32::Fat32FileSystem::new(file_info.device_id)
+                    .map_err(|_| MmapError::FileError)?;
+                Ok(Arc::new(fat32_fs))
+            },
+            FilesystemType::Ntfs => {
+                let ntfs_fs = crate::core::fs::ntfs::NtfsFileSystem::new(file_info.device_id)
+                    .map_err(|_| MmapError::FileError)?;
+                Ok(Arc::new(ntfs_fs))
+            },
+            FilesystemType::ExFat => {
+                let exfat_fs = crate::core::fs::exfat::ExFatFileSystem::new(file_info.device_id)
+                    .map_err(|_| MmapError::FileError)?;
+                Ok(Arc::new(exfat_fs))
+            },
+        }
+    }
+    
+    fn check_file_cache(&self, file_id: usize, offset: usize) -> Option<Vec<u8>> {
+        // 効率的なLRUファイルページキャッシュ実装
+        static GLOBAL_FILE_CACHE: Once<GlobalFileDataCache> = Once::new();
+        
+        let cache = GLOBAL_FILE_CACHE.call_once(|| {
+            GlobalFileDataCache::new(1000) // 最大1000エントリ
+        });
+        
+        cache.get(file_id, offset)
+    }
+    
+    fn cache_file_data(&self, file_id: usize, offset: usize, data: &[u8]) {
+        // グローバルファイルキャッシュにデータを保存
+        static GLOBAL_FILE_CACHE: Once<GlobalFileDataCache> = Once::new();
+        
+        let cache = GLOBAL_FILE_CACHE.call_once(|| {
+            GlobalFileDataCache::new(1000) // 最大1000エントリ
+        });
+        
+        // データが1ページより大きい場合は先頭ページのみキャッシュ
+        let cache_data = if data.len() > PAGE_SIZE {
+            data[..PAGE_SIZE].to_vec()
+        } else {
+            data.to_vec()
+        };
+        
+        cache.insert(file_id, offset, cache_data);
+        
+        log::trace!("ファイルデータキャッシュ保存: file_id={}, offset=0x{:x}, size={}", 
+                   file_id, offset, data.len());
+    }
+    
+    /// 仮想メモリアドレスを物理アドレスに変換してページをマップ
+            None
+        }
+    }
+    
+    fn insert(&self, file_id: usize, offset: usize, data: Vec<u8>) {
+        let current_time = self.get_current_time();
+        
+        // キャッシュ容量チェック
+        if self.current_entries.load(Ordering::Relaxed) >= self.max_entries {
+            self.evict_oldest_entries();
+        }
+        
+        let cached_page = CachedPage {
+            data,
+            timestamp: current_time,
+            access_count: AtomicUsize::new(1),
+        };
+        
+        let mut cache = self.cache.write();
+        if cache.insert((file_id, offset), cached_page).is_none() {
+            self.current_entries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    
+    fn evict_oldest_entries(&self) {
+        let mut cache = self.cache.write();
+        
+        // 最も古いエントリを削除（LRU）
+        let target_count = self.max_entries / 4; // 25%削除
+        let mut entries_to_remove = Vec::new();
+        
+        // タイムスタンプでソートして古いものを特定
+        let mut sorted_entries: Vec<_> = cache.iter()
+            .map(|(key, page)| (*key, page.timestamp))
+            .collect();
+        sorted_entries.sort_by_key(|(_, timestamp)| *timestamp);
+        
+        for (key, _) in sorted_entries.iter().take(target_count) {
+            entries_to_remove.push(*key);
+        }
+        
+        // エントリを削除
+        for key in entries_to_remove {
+            cache.remove(&key);
+            self.current_entries.fetch_sub(1, Ordering::Relaxed);
+        }
+        
+        log::debug!("キャッシュエビクション完了: {}エントリ削除", target_count);
+    }
+    
+    fn get_current_time(&self) -> u64 {
+        // タイムスタンプ取得（簡易実装）
+        crate::core::time::get_timestamp_ns()
+    }
+}
+
+// グローバルキャッシュインスタンス
+static GLOBAL_FILE_DATA_CACHE: GlobalFileDataCache = GlobalFileDataCache::new(1024);
+
+/// ファイルシステムタイプ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemType {
+    Ext4,
+    Fat32,
+    Ntfs,
+    ExFat,
+}
+
+/// VMAフラグ
+bitflags::bitflags! {
+    pub struct VmaFlags: u32 {
+        const READ = 1 << 0;
+        const WRITE = 1 << 1;
+        const EXEC = 1 << 2;
+        const USER = 1 << 3;
+        const CACHE_DISABLE = 1 << 4;
+        const WRITE_THROUGH = 1 << 5;
+        const WRITE_COMBINING = 1 << 6;
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+    
+    /// 共有メモリページを取得
+    fn get_shared_memory_page(shared_id: usize, offset: usize) -> Result<PhysAddr, MmapError> {
+        // 共有メモリオブジェクトから指定されたオフセットの物理ページアドレスを取得します。
+        // この関数は共有メモリ管理モジュール (例: crate::core::ipc::shmem) と連携する必要があります。
+        // 共有オブジェクトが存在しない、オフセットが範囲外などのエラー処理も必要です。
+        Err(MmapError::SharedMemoryError)
+    }
+
+    /// テレページをフェッチ
+    fn fetch_telepage(node_id: usize, remote_phys_addr: PhysAddr) -> Result<Page, MmapError> {
+        // リモートノードからテレページをフェッチし、ローカルに物理ページを割り当てて内容をコピーします。
+        // この関数はテレページ管理モジュール (例: crate::core::memory::telepage) と連携し、
+        // ネットワーク通信を介してリモートノードからデータを取得する必要があります。
+        Err(MmapError::TelePageError)
+    }
+
+    /// グローバルなVMAキャッシュ
+    pub static VMA_CACHE: Mutex<Option<SlabCache>> = Mutex::new(None);
+
+    /// メモリマッピングサブシステムを初期化
+    pub fn init_mmap() {
+        let mut cache_lock = VMA_CACHE.lock();
+        *cache_lock = Some(SlabCache::new("vma_cache", core::mem::size_of::<VirtualMemoryArea>(), 8));
+    }
+
+    // グローバルAPI関数
+    // これらの関数はカーネル内の他のモジュールから呼び出される
+
+    /// 物理メモリ領域を指定アドレスにマップ
+    pub fn map_physical(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        phys_addr: PhysAddr,
+        size: usize,
+        permissions: MapPermissions,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            permissions,
+            MapType::Ram { phys_addr },
+        )
+    }
+
+    /// 匿名メモリ領域を指定アドレスにマップ
+    pub fn map_anonymous(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        size: usize,
+        permissions: MapPermissions,
+        zero_on_demand: bool,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            permissions,
+            MapType::Anonymous { zero_on_demand },
+        )
+    }
+
+    /// デバイスメモリを指定アドレスにマップ
+    pub fn map_device(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        phys_addr: PhysAddr,
+        size: usize,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            MapPermissions::device(),
+            MapType::Device { phys_addr },
+        )
+    }
+
+    /// ファイルを指定アドレスにマップ
+    pub fn map_file(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        file_id: usize,
+        offset: usize,
+        size: usize,
+        permissions: MapPermissions,
+        file_perms: FilePermissions,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            permissions,
+            MapType::File {
+                file_id,
+                offset,
+                file_perms,
+            },
+        )
+    }
+
+    /// 共有メモリを指定アドレスにマップ
+    pub fn map_shared(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        shared_id: usize,
+        offset: usize,
+        size: usize,
+        permissions: MapPermissions,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            permissions,
+            MapType::Shared {
+                shared_id,
+                offset,
+            },
+        )
+    }
+
+    /// テレページを指定アドレスにマップ
+    pub fn map_telepage(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        node_id: usize,
+        remote_phys_addr: PhysAddr,
+        size: usize,
+        permissions: MapPermissions,
+    ) -> Result<VirtAddr, MmapError> {
+        addr_space.map(
+            virt_addr,
+            size,
+            permissions,
+            MapType::TelePage {
+                node_id,
+                remote_phys_addr,
+            },
+        )
+    }
+
+    /// 指定範囲のメモリをアンマップ
+    pub fn unmap(
+        addr_space: &AddressSpace,
+        virt_addr: VirtAddr,
+        size: usize,
+    ) -> Result<(), MmapError> {
+        addr_space.unmap(virt_addr, size)
+    }
+
+    /// ページフォルトを処理
+    pub fn handle_page_fault(
+        addr_space: &AddressSpace,
+        fault_addr: VirtAddr,
+        write_access: bool,
+        instruction_fetch: bool,
+    ) -> Result<(), MmapError> {
+        addr_space.handle_page_fault(fault_addr, write_access, instruction_fetch)
+    }
+
+    /// SLUB支援マッピングの作成
+    /// 
+    /// SLUBアロケータを使用して小さいオブジェクトを効率的に管理するための
+    /// メモリマッピングを作成します。
+    /// 
+    /// # 引数
+    /// * `page_table` - ページテーブル
+    /// * `vaddr` - マッピングする仮想アドレス（NULLの場合は自動割り当て）
+    /// * `object_size` - 各オブジェクトのサイズ（バイト）
+    /// * `alignment` - アラインメント要件（バイト）
+    /// * `prot` - 保護フラグ（読み取り/書き込み/実行）
+    /// * `flags` - マッピングフラグ
+    /// 
+    /// # 戻り値
+    /// * 成功した場合はマッピング結果、失敗した場合はNone
+    pub fn slub_mmap(
+        page_table: &mut PageTable,
+        vaddr: Option<VirtualAddress>,
+        object_size: usize,
+        alignment: usize,
+        count: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Option<MappingResult> {
+        // サイズが0またはオブジェクト数が0の場合は無効
+        if object_size == 0 || count == 0 {
+            warn!("slub_mmap: オブジェクトサイズまたは数が0のマッピングは無効です");
+            return None;
+        }
+        
+        // SLUBキャッシュ名を生成
+        let cache_name = match object_size {
+            8 => "size-8",
+            16 => "size-16",
+            32 => "size-32",
+            64 => "size-64",
+            128 => "size-128",
+            256 => "size-256",
+            512 => "size-512",
+            1024 => "size-1024",
+            2048 => "size-2048",
+            4096 => "size-4096",
+            _ => {
+                // 標準サイズ以外は独自のキャッシュを作成
+                let custom_name = format!("mmap-{}", object_size);
+                let static_name = Box::leak(custom_name.into_boxed_str());
+                
+                // キャッシュが存在しない場合は作成
+                slub_api::create_cache(static_name, object_size, alignment);
+                static_name
+            }
+        };
+        
+        // 必要なサイズを計算
+        let total_size = object_size * count;
+        let aligned_size = (total_size + page_api::PAGE_SIZE - 1) & !(page_api::PAGE_SIZE - 1);
+        
+        // VMAタイプを決定
+        let vma_type = determine_vma_type(prot, flags);
+        
+        // キャッシュポリシーを決定
+        let cache_policy = determine_cache_policy(flags);
+        
+        // マッピングアドレスを決定
+        let mapping_addr = match vaddr {
+            Some(addr) if flags & flags::FIXED != 0 => {
+                // 固定アドレスの場合、既存のマッピングがあれば解除
+                let aligned_addr = addr & !(page_api::PAGE_SIZE - 1);
+                if unmap(page_table, aligned_addr, aligned_size).is_none() {
+                    warn!("slub_mmap: 既存マッピングの解除に失敗しました");
+                    return None;
+                }
                 aligned_addr
-            } else {
-                // 指定されたアドレスが使用中なら自動割り当て
+            },
+            Some(addr) => {
+                // 推奨アドレスが指定されている場合
+                let aligned_addr = addr & !(page_api::PAGE_SIZE - 1);
+                if vma_api::is_region_free(page_table, aligned_addr, aligned_size) {
+                    aligned_addr
+                } else {
+                    // 指定されたアドレスが使用中なら自動割り当て
+                    vma_api::find_free_region(page_table, aligned_size, page_api::PAGE_SIZE)?
+                }
+            },
+            None => {
+                // アドレス自動割り当て
                 vma_api::find_free_region(page_table, aligned_size, page_api::PAGE_SIZE)?
             }
-        },
-        None => {
-            // アドレス自動割り当て
-            vma_api::find_free_region(page_table, aligned_size, page_api::PAGE_SIZE)?
-        }
-    };
-    
-    // VMAを作成
-    let vma = VirtualMemoryArea {
-        range: mapping_addr..(mapping_addr + aligned_size),
-        physical_mapping: None,  // マッピングはSLUBで管理
-        vma_type,
+        };
+        
+        // VMAを作成
+        let vma = VirtualMemoryArea {
+            range: mapping_addr..(mapping_addr + aligned_size),
+            physical_mapping: None,  // マッピングはSLUBで管理
+            vma_type,
         permissions: prot,
         cache_policy,
         file_descriptor: None,

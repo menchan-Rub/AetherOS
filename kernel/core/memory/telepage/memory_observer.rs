@@ -482,10 +482,7 @@ impl MemoryObserver {
 
     /// 現在時刻を取得（ナノ秒）
     fn get_current_time() -> u64 {
-        // 実際の実装ではシステム時間を取得
-        // 仮の実装としてカウンタを使用
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        COUNTER.fetch_add(1000000, Ordering::Relaxed) // 1msずつ増加
+        arch::current_time_ns()
     }
 
     /// ページ統計のクリーンアップ（古いエントリの削除）

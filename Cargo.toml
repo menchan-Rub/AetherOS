@@ -1,0 +1,181 @@
+[package]
+name = "aetheros"
+version = "0.1.0"
+edition = "2021"
+authors = ["AetherOS Team"]
+description = "世界最高性能・最高信頼性のオペレーティングシステムカーネル"
+license = "MIT"
+repository = "https://github.com/aetheros/aetheros"
+readme = "README.md"
+keywords = ["os", "kernel", "rust", "operating-system"]
+categories = ["os", "no-std"]
+
+[lib]
+name = "aetheros"
+crate-type = ["staticlib"]
+
+[[bin]]
+name = "aetheros"
+path = "kernel/main.rs"
+
+[dependencies]
+# 基本ライブラリ
+linked_list_allocator = "0.10"
+spin = "0.9"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+bit_field = "0.10"
+bitflags = "2.4"
+volatile = "0.4"
+heapless = "0.8"
+nb = "1.1"
+embedded-hal = "1.0"
+
+# アーキテクチャ固有
+x86_64 = "0.14"
+uart_16550 = "0.2"
+pic8259 = "0.10"
+pc-keyboard = "0.7"
+
+# ブートローダー
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+
+# 暗号化
+sha2 = { version = "0.10", default-features = false }
+aes = { version = "0.8", default-features = false }
+rsa = { version = "0.9", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+
+# ネットワーク
+smoltcp = { version = "0.11", default-features = false, features = [
+    "std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", 
+    "proto-ipv6", "proto-tcp", "proto-udp", "proto-dns", "socket-tcp", 
+    "socket-udp", "socket-dns", "async"
+]}
+
+# ファイルシステム
+fatfs = { version = "0.3", default-features = false }
+
+# ログ
+log = { version = "0.4", default-features = false }
+
+# 時間
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# 数学ライブラリ
+libm = "0.2"
+
+# 文字列処理
+tinyvec = { version = "1.6", features = ["alloc"] }
+
+# アロケータ
+linked-list-allocator = "0.10"
+slab_allocator = "0.4"
+
+# アトミック操作
+crossbeam-utils = { version = "0.8", default-features = false }
+
+# ACPI
+acpi = "5.0"
+
+# PCI
+pci_types = "0.7"
+
+# USB
+usb-device = { version = "0.3", default-features = false }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid = "11.0"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+cortex-a = "8.1"
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = "0.10"
+
+[profile.dev]
+# デバッグビルド設定
+panic = "abort"
+opt-level = 0
+debug = true
+overflow-checks = true
+
+[profile.release]
+# リリースビルド設定（最適化）
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = false
+strip = true
+
+[profile.test]
+# テスト設定
+panic = "unwind"
+opt-level = 0
+debug = true
+
+[features]
+# デフォルト機能
+default = ["x86_64", "acpi", "network", "graphics", "usb"]
+
+# アーキテクチャサポート
+x86_64 = []
+aarch64 = []
+riscv64 = []
+
+# ハードウェア機能
+acpi = ["dep:acpi"]
+network = ["dep:smoltcp"]
+graphics = []
+usb = ["dep:usb-device"]
+sound = []
+virtio = []
+
+# セキュリティ機能
+quantum-security = []
+secure-boot = []
+tpm = []
+
+# 高度な機能
+universal-compatibility = []
+real-time = []
+multikernel = []
+self-healing = []
+dynamic-update = []
+
+# デバッグ機能
+debug-serial = []
+debug-graphics = []
+debug-memory = []
+debug-process = []
+
+# 最適化機能
+numa-optimization = []
+cpu-affinity = []
+zero-copy-io = []
+hardware-acceleration = []
+
+[workspace]
+members = [
+    "kernel",
+    "bootloader", 
+    "userspace",
+    "tests",
+    "tools"
+]
+
+[package.metadata.bootimage]
+# bootimageの設定
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none"
+]
+test-success-exit-code = 33
+test-timeout = 30
+
+[package.metadata.docs.rs]
+# docs.rs設定
+all-features = true
+targets = ["x86_64-unknown-none"] 

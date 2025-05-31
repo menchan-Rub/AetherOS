@@ -1,466 +1,542 @@
-// AetherOS テレページングシステム
+// AetherOS TelePage モジュール
 //
-// このモジュールはカーネルの高度なページ管理機能「テレページング」を実装します。
-// テレページングは、仮想メモリ最適化のための先進的手法で、頻繁にアクセスされる
-// ページを予測的に管理し、効率的なメモリアクセスを実現します。
+// このモジュールは高帯域メモリ(HBM)と標準DRAM間のインテリジェントなページ移動を実装します。
+// メモリアクセスパターンを監視し、最も効率的なメモリ階層に自動的にデータを移動します。
 
-mod predictor;
-mod prefetcher;
-mod migration;
-
-use crate::arch::MemoryInfo;
-use crate::core::sync::{Mutex, RwLock};
-use alloc::collections::BTreeMap;
+use crate::core::memory::{hbm, MemoryTier, MemoryStats};
+use crate::core::memory::locality::{self, AccessPattern, DataBlock};
+use crate::core::memory::mm::{self, PageFlags, PhysicalAddress};
+use crate::time;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use log::{debug, error, info, trace, warn};
-use predictor::{AccessPattern, AccessPredictor};
-use prefetcher::PagePrefetcher;
-use migration::PageMigrator;
 
-/// テレページングの動作モード
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelepagingMode {
-    /// 無効
-    Disabled,
-    /// 予測のみ（プリフェッチなし）
-    PredictionOnly,
-    /// プリフェッチのみ（マイグレーションなし）
-    PrefetchOnly,
-    /// フル機能（予測・プリフェッチ・マイグレーション）
-    Full,
+// モジュールをエクスポート
+pub mod config;
+pub mod policy;
+pub mod stats;
+
+/// TelePageエンジン
+pub struct TelePage {
+    /// 有効化フラグ
+    enabled: AtomicBool,
+    /// アクセス追跡エンジン
+    tracker: AccessTracker,
+    /// 現在のポリシー
+    policy: policy::PageMigrationPolicy,
+    /// 統計情報
+    stats: stats::TelePageStats,
+    /// 設定情報
+    config: config::TelePageConfig,
 }
 
-/// テレページング設定オプション
-#[derive(Debug, Clone)]
-pub struct TelepagingOptions {
-    /// 動作モード
-    pub mode: TelepagingMode,
-    /// プリフェッチウィンドウサイズ（ページ数）
-    pub prefetch_window: usize,
-    /// 予測先読みのしきい値（アクセス確率 0-100）
-    pub prediction_threshold: u8,
-    /// 最大マイグレーション距離（ページ数）
-    pub max_migration_distance: usize,
-    /// メモリアクセスパターン検出の感度
-    pub pattern_sensitivity: u8,
-    /// 学習モード有効
-    pub learning_enabled: bool,
-    /// トレースモード有効
-    pub tracing_enabled: bool,
-}
+/// グローバルインスタンス
+static mut TELEPAGE: Option<TelePage> = None;
 
-impl Default for TelepagingOptions {
-    fn default() -> Self {
-        Self {
-            mode: TelepagingMode::PredictionOnly,
-            prefetch_window: 16,
-            prediction_threshold: 75,
-            max_migration_distance: 64,
-            pattern_sensitivity: 80,
-            learning_enabled: true,
-            tracing_enabled: false,
-        }
-    }
-}
-
-/// ページアクセス統計
-#[derive(Debug, Clone, Default)]
-struct PageAccessStats {
-    /// アクセス回数
-    access_count: usize,
-    /// 最後のアクセス時刻
-    last_access: u64,
-    /// アクセスパターン
-    pattern: AccessPattern,
-    /// マイグレーション回数
-    migration_count: usize,
-    /// プリフェッチ回数
-    prefetch_count: usize,
-    /// プリフェッチヒット
-    prefetch_hits: usize,
-}
-
-/// テレページングエンジン
-pub struct TelepagingEngine {
-    /// 初期化済みフラグ
-    initialized: AtomicBool,
-    /// 設定オプション
-    options: RwLock<TelepagingOptions>,
-    /// ページアクセス統計
-    page_stats: Mutex<BTreeMap<usize, PageAccessStats>>,
-    /// アクセスパターン予測器
-    predictor: Mutex<AccessPredictor>,
-    /// ページプリフェッチャ
-    prefetcher: Mutex<PagePrefetcher>,
-    /// ページマイグレーション
-    migrator: Mutex<PageMigrator>,
-    /// 総ページアクセス数
-    total_accesses: AtomicUsize,
-    /// プリフェッチ成功数
-    prefetch_hits: AtomicUsize,
-    /// プリフェッチ試行数
-    prefetch_attempts: AtomicUsize,
-    /// マイグレーション成功数
-    migration_success: AtomicUsize,
-    /// マイグレーション試行数
-    migration_attempts: AtomicUsize,
-    /// タイムスタンプカウンタ
-    timestamp: AtomicUsize,
-    /// アクティブなトラッキングページ
-    tracking_pages: RwLock<Vec<usize>>,
-    /// ホットページのリスト
-    hot_pages: RwLock<Vec<usize>>,
-    /// コールドページのリスト
-    cold_pages: RwLock<Vec<usize>>,
-}
-
-/// グローバルテレページングエンジン
-static mut TELEPAGING_ENGINE: Option<TelepagingEngine> = None;
-
-impl TelepagingEngine {
-    /// 新しいテレページングエンジンを作成
-    pub fn new() -> Self {
-        Self {
-            initialized: AtomicBool::new(false),
-            options: RwLock::new(TelepagingOptions::default()),
-            page_stats: Mutex::new(BTreeMap::new()),
-            predictor: Mutex::new(AccessPredictor::new()),
-            prefetcher: Mutex::new(PagePrefetcher::new()),
-            migrator: Mutex::new(PageMigrator::new()),
-            total_accesses: AtomicUsize::new(0),
-            prefetch_hits: AtomicUsize::new(0),
-            prefetch_attempts: AtomicUsize::new(0),
-            migration_success: AtomicUsize::new(0),
-            migration_attempts: AtomicUsize::new(0),
-            timestamp: AtomicUsize::new(0),
-            tracking_pages: RwLock::new(Vec::new()),
-            hot_pages: RwLock::new(Vec::new()),
-            cold_pages: RwLock::new(Vec::new()),
-        }
-    }
-
-    /// テレページングエンジンを初期化
-    pub fn init(&self, mem_info: &MemoryInfo) -> Result<(), &'static str> {
-        if self.initialized.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        // 各コンポーネントを初期化
-        let mut predictor = self.predictor.lock();
-        predictor.init();
-        drop(predictor);
-
-        let mut prefetcher = self.prefetcher.lock();
-        prefetcher.init(mem_info);
-        drop(prefetcher);
-
-        let mut migrator = self.migrator.lock();
-        migrator.init(mem_info);
-        drop(migrator);
-
-        // 設定を適用
-        let options = self.options.read().unwrap();
-        if options.mode != TelepagingMode::Disabled {
-            info!("テレページングシステムを初期化: モード={:?}", options.mode);
-        } else {
-            info!("テレページングシステムは無効化されています");
-        }
-
-        self.initialized.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// ページアクセスをトラック
-    pub fn track_page_access(&self, page_addr: usize) {
-        if !self.initialized.load(Ordering::Acquire) || self.is_disabled() {
-            return;
-        }
-
-        let timestamp = self.increment_timestamp();
-        let mut stats = self.page_stats.lock();
-        
-        // 既存の統計を更新または新規作成
-        let entry = stats.entry(page_addr).or_insert_with(PageAccessStats::default);
-        entry.access_count += 1;
-        entry.last_access = timestamp;
-        
-        // グローバル統計も更新
-        self.total_accesses.fetch_add(1, Ordering::Relaxed);
-        
-        // アクセスパターンの更新（定期的）
-        if entry.access_count % 10 == 0 {
-            let mut predictor = self.predictor.lock();
-            entry.pattern = predictor.analyze_pattern(page_addr, entry.access_count, timestamp);
-            
-            // ホット/コールドページリスト更新
-            if entry.pattern == AccessPattern::Hot {
-                let mut hot_pages = self.hot_pages.write().unwrap();
-                if !hot_pages.contains(&page_addr) {
-                    hot_pages.push(page_addr);
-                    
-                    // コールドリストから削除（もしあれば）
-                    let mut cold_pages = self.cold_pages.write().unwrap();
-                    if let Some(idx) = cold_pages.iter().position(|&p| p == page_addr) {
-                        cold_pages.remove(idx);
-                    }
-                }
-            } else if entry.pattern == AccessPattern::Cold {
-                let mut cold_pages = self.cold_pages.write().unwrap();
-                if !cold_pages.contains(&page_addr) {
-                    cold_pages.push(page_addr);
-                    
-                    // ホットリストから削除（もしあれば）
-                    let mut hot_pages = self.hot_pages.write().unwrap();
-                    if let Some(idx) = hot_pages.iter().position(|&p| p == page_addr) {
-                        hot_pages.remove(idx);
-                    }
-                }
-            }
-        }
-    }
-
-    /// ページフォルト時の処理
-    pub fn handle_page_fault(&self, fault_addr: usize) -> bool {
-        if !self.initialized.load(Ordering::Acquire) || self.is_disabled() {
-            return false;
-        }
-        
-        // プリフェッチと予測を試みる
-        let timestamp = self.increment_timestamp();
-        
-        // 1. プリフェッチを試みる（PrefetchOnlyモード以上）
-        let options = self.options.read().unwrap();
-        let prefetch_result = if options.mode == TelepagingMode::PrefetchOnly || 
-                                options.mode == TelepagingMode::Full {
-            let mut prefetcher = self.prefetcher.lock();
-            self.prefetch_attempts.fetch_add(1, Ordering::Relaxed);
-            
-            if prefetcher.try_prefetch(fault_addr, options.prefetch_window) {
-                self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        
-        // 2. マイグレーションを試みる（Fullモードのみ）
-        let migration_result = if options.mode == TelepagingMode::Full {
-            let mut migrator = self.migrator.lock();
-            self.migration_attempts.fetch_add(1, Ordering::Relaxed);
-            
-            if migrator.try_migrate(fault_addr, options.max_migration_distance) {
-                self.migration_success.fetch_add(1, Ordering::Relaxed);
-                
-                // 統計を更新
-                let mut stats = self.page_stats.lock();
-                if let Some(entry) = stats.get_mut(&fault_addr) {
-                    entry.migration_count += 1;
-                }
-                
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        
-        // 3. アクセスパターン予測を更新（PredictionOnlyモード以上）
-        if options.mode == TelepagingMode::PredictionOnly || 
-           options.mode == TelepagingMode::Full {
-            let mut predictor = self.predictor.lock();
-            predictor.record_fault(fault_addr, timestamp);
-            
-            // 今後のフォルトを予測
-            let predicted_pages = predictor.predict_future_accesses(fault_addr, 
-                                                                   options.prediction_threshold);
-            
-            // プリフェッチが有効ならこれらのページをプリフェッチ
-            if (options.mode == TelepagingMode::PrefetchOnly || options.mode == TelepagingMode::Full) && 
-               !predicted_pages.is_empty() {
-                let mut prefetcher = self.prefetcher.lock();
-                for &page in predicted_pages.iter().take(options.prefetch_window) {
-                    prefetcher.queue_prefetch(page);
-                }
-            }
-        }
-        
-        // ページフォルト処理成功を示す（実際のフォルト解決はMMUがする）
-        prefetch_result || migration_result
-    }
-
-    /// テレページング設定を変更
-    pub fn configure(&self, options: TelepagingOptions) -> Result<(), &'static str> {
-        if !self.initialized.load(Ordering::Acquire) {
-            return Err("テレページングエンジンが初期化されていません");
-        }
-        
-        let mut current_options = self.options.write().unwrap();
-        *current_options = options;
-        
-        info!("テレページング設定を更新: モード={:?}", current_options.mode);
-        
-        // コンポーネントに設定を反映
-        if current_options.mode != TelepagingMode::Disabled {
-            let mut predictor = self.predictor.lock();
-            predictor.set_sensitivity(current_options.pattern_sensitivity);
-            predictor.set_learning_enabled(current_options.learning_enabled);
-            drop(predictor);
-            
-            let mut prefetcher = self.prefetcher.lock();
-            prefetcher.set_window_size(current_options.prefetch_window);
-            drop(prefetcher);
-            
-            let mut migrator = self.migrator.lock();
-            migrator.set_max_distance(current_options.max_migration_distance);
-            drop(migrator);
-        }
-        
-        Ok(())
+/// モジュールの初期化
+pub fn init() -> Result<(), &'static str> {
+    let config = config::TelePageConfig::default();
+    
+    // HBMサポートを確認
+    if !hbm::is_available() && config.require_hbm {
+        log::warn!("HBMが利用できないためTelePageは無効になります");
+        return Ok(());
     }
     
-    /// 予測されたホットページをプリロード
-    pub fn preload_hot_pages(&self) -> Result<usize, &'static str> {
-        if !self.initialized.load(Ordering::Acquire) || self.is_disabled() {
-            return Ok(0);
-        }
-        
-        let options = self.options.read().unwrap();
-        if options.mode != TelepagingMode::PrefetchOnly && 
-           options.mode != TelepagingMode::Full {
-            return Ok(0);
-        }
-        
-        let hot_pages = self.hot_pages.read().unwrap();
-        let mut count = 0;
-        
-        let mut prefetcher = self.prefetcher.lock();
-        for &page in hot_pages.iter() {
-            if prefetcher.try_prefetch(page, 1) {
-                count += 1;
+    log::info!("TelePageモジュールを初期化しています");
+    
+    // インスタンスを作成
+    let telepage = TelePage {
+        enabled: AtomicBool::new(config.enabled_by_default),
+        tracker: AccessTracker::new(config.page_track_capacity),
+        policy: policy::PageMigrationPolicy::new(),
+        stats: stats::TelePageStats::new(),
+        config,
+    };
+    
+    // グローバルインスタンスを設定
+    unsafe {
+        TELEPAGE = Some(telepage);
+    }
+    
+    // 定期的なスキャンタスクを登録
+    if config.enabled_by_default {
+        register_periodic_scan()?;
+    }
+    
+    log::info!("TelePageモジュールの初期化が完了しました");
+    Ok(())
+}
+
+/// TelePageを有効化
+pub fn enable() -> Result<(), &'static str> {
+    unsafe {
+        if let Some(telepage) = TELEPAGE.as_mut() {
+            if telepage.enabled.load(Ordering::Relaxed) {
+                return Ok(());
             }
             
-            // 一度に多すぎるとシステムに負荷がかかるため制限
-            if count >= 32 {
-                break;
-            }
-        }
-        
-        Ok(count)
-    }
-
-    /// ページマイグレーションを最適化
-    pub fn optimize_page_layout(&self) -> Result<usize, &'static str> {
-        if !self.initialized.load(Ordering::Acquire) || 
-           self.options.read().unwrap().mode != TelepagingMode::Full {
-            return Ok(0);
-        }
-        
-        let hot_pages = self.hot_pages.read().unwrap();
-        let mut count = 0;
-        
-        let mut migrator = self.migrator.lock();
-        for i in 1..hot_pages.len() {
-            // 関連性の高いホットページ同士を近づける
-            if migrator.try_colocate(hot_pages[i-1], hot_pages[i]) {
-                count += 1;
-            }
-        }
-        
-        Ok(count)
-    }
-
-    /// 現在のタイムスタンプを増加して取得
-    fn increment_timestamp(&self) -> u64 {
-        self.timestamp.fetch_add(1, Ordering::Relaxed) as u64
-    }
-
-    /// テレページングが無効かどうか確認
-    fn is_disabled(&self) -> bool {
-        self.options.read().unwrap().mode == TelepagingMode::Disabled
-    }
-
-    /// 統計情報を取得
-    pub fn get_stats(&self) -> (usize, usize, usize, f32, usize, usize) {
-        // (総アクセス数, プリフェッチヒット, 総プリフェッチ試行, ヒット率, マイグレーション成功, マイグレーション試行)
-        let total = self.total_accesses.load(Ordering::Relaxed);
-        let hits = self.prefetch_hits.load(Ordering::Relaxed);
-        let attempts = self.prefetch_attempts.load(Ordering::Relaxed);
-        let hit_rate = if attempts > 0 {
-            (hits as f32 / attempts as f32) * 100.0
+            telepage.enabled.store(true, Ordering::SeqCst);
+            register_periodic_scan()?;
+            log::info!("TelePageを有効化しました");
+            Ok(())
         } else {
-            0.0
-        };
-        let mig_success = self.migration_success.load(Ordering::Relaxed);
-        let mig_attempts = self.migration_attempts.load(Ordering::Relaxed);
-        
-        (total, hits, attempts, hit_rate, mig_success, mig_attempts)
-    }
-
-    /// ホットページ数とコールドページ数を取得
-    pub fn get_page_counts(&self) -> (usize, usize, usize) {
-        let hot = self.hot_pages.read().unwrap().len();
-        let cold = self.cold_pages.read().unwrap().len();
-        let total = self.page_stats.lock().len();
-        
-        (hot, cold, total)
+            Err("TelePageモジュールが初期化されていません")
+        }
     }
 }
 
-/// グローバルテレページングエンジンへのアクセス
-pub fn engine() -> &'static TelepagingEngine {
+/// TelePageを無効化
+pub fn disable() -> Result<(), &'static str> {
     unsafe {
-        TELEPAGING_ENGINE.as_ref().expect("テレページングエンジンが初期化されていません")
+        if let Some(telepage) = TELEPAGE.as_mut() {
+            telepage.enabled.store(false, Ordering::SeqCst);
+            unregister_periodic_scan();
+            log::info!("TelePageを無効化しました");
+            Ok(())
+        } else {
+            Err("TelePageモジュールが初期化されていません")
+        }
     }
 }
 
-/// テレページングサブシステムを初期化
-pub fn init() -> Result<(), &'static str> {
-    unsafe {
-        if TELEPAGING_ENGINE.is_none() {
-            TELEPAGING_ENGINE = Some(TelepagingEngine::new());
+/// 定期スキャンタスクを登録
+fn register_periodic_scan() -> Result<(), &'static str> {
+    crate::scheduling::register_periodic_task(
+        scan_and_migrate_pages,
+        "telepage_scan",
+        unsafe { TELEPAGE.as_ref().unwrap().config.scan_interval_ms }
+    )
+}
+
+/// 定期スキャンタスクの登録を解除
+fn unregister_periodic_scan() {
+    let _ = crate::scheduling::unregister_task_by_name("telepage_scan");
+}
+
+/// アクセス追跡エンジン
+struct AccessTracker {
+    /// 追跡中のページ
+    tracked_pages: Vec<TrackedPage>,
+    /// 最大容量
+    capacity: usize,
+}
+
+impl AccessTracker {
+    /// 新しいアクセス追跡エンジンを作成
+    fn new(capacity: usize) -> Self {
+        Self {
+            tracked_pages: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+    
+    /// ページの追跡を開始
+    fn track_page(&mut self, virt_addr: usize, phys_addr: PhysicalAddress, tier: MemoryTier) -> usize {
+        // すでに追跡されているか確認
+        for (idx, page) in self.tracked_pages.iter().enumerate() {
+            if page.virtual_address == virt_addr {
+                return idx;
+            }
         }
         
-        // メモリ情報を取得
-        let mem_info = crate::arch::get_memory_info();
-        TELEPAGING_ENGINE.as_ref().unwrap().init(&mem_info)
+        // 容量をチェック
+        if self.tracked_pages.len() >= self.capacity {
+            // 最も古いページを削除
+            self.remove_least_accessed();
+        }
+        
+        // 新しいページを追加
+        let page_id = self.tracked_pages.len();
+        
+        // ページサイズを取得
+        let page_size = mm::get_page_size();
+        
+        self.tracked_pages.push(TrackedPage {
+            virtual_address: virt_addr,
+            physical_address: phys_addr,
+            current_tier: tier,
+            last_access_time: time::current_time_ms(),
+            access_count: AtomicUsize::new(0),
+            hot_count: AtomicUsize::new(0),
+            cold_count: AtomicUsize::new(0),
+            block_id: locality::register_data_block(virt_addr, page_size, None),
+            size: page_size,
+        });
+        
+        page_id
+    }
+    
+    /// 最もアクセスが少ないページを削除
+    fn remove_least_accessed(&mut self) {
+        if self.tracked_pages.is_empty() {
+            return;
+        }
+        
+        let current_time = time::current_time_ms();
+        let mut least_score = f64::MAX;
+        let mut least_idx = 0;
+        
+        // アクセス頻度とタイムスタンプの組み合わせでスコア計算
+        for (idx, page) in self.tracked_pages.iter().enumerate() {
+            let access_count = page.access_count.load(Ordering::Relaxed) as f64;
+            let age_ms = current_time - page.last_access_time;
+            
+            // スコア = アクセス数 / 経過時間（ms） - 小さいほど削除候補
+            let score = if age_ms > 0 {
+                access_count / (age_ms as f64)
+            } else {
+                access_count
+            };
+            
+            if score < least_score {
+                least_score = score;
+                least_idx = idx;
+            }
+        }
+        
+        // 最も低スコアのページを削除
+        self.tracked_pages.remove(least_idx);
+    }
+    
+    /// メモリアクセスを記録
+    fn record_access(&mut self, virt_addr: usize) {
+        // アドレスをページアラインする
+        let page_size = mm::get_page_size();
+        let page_addr = virt_addr & !(page_size - 1);
+        
+        // ページを探す
+        for page in &self.tracked_pages {
+            if page.virtual_address == page_addr {
+                page.access_count.fetch_add(1, Ordering::Relaxed);
+                
+                // アクセスパターンを記録
+                locality::record_memory_access(page.block_id, virt_addr - page_addr);
+                
+                // タイムスタンプを更新
+                page.last_access_time = time::current_time_ms();
+                return;
+            }
+        }
+        
+        // ページが見つからない場合 (まだ追跡されていないページへのアクセス)
+        // 実際には、このようなアクセスはページフォールト等を経て、必要に応じて
+        // tracker.track_page() が明示的に呼び出されることで追跡が開始されるべき。
+        // record_access はあくまで「既に追跡中のページ」のアクセス情報を記録する。
+        log::trace!("Access recorded for untracked page (virt_addr: {:#x}). Tracking will start upon explicit request (e.g., via page fault handler).");
+    }
+    
+    /// ページアクセスを分析して移行候補を特定
+    fn analyze_pages(&self) -> Vec<MigrationCandidate> {
+        let mut candidates = Vec::new();
+        let current_time = time::current_time_ms();
+        
+        for (idx, page) in self.tracked_pages.iter().enumerate() {
+            // 最終アクセスからの経過時間をチェック
+            let age_ms = current_time - page.last_access_time;
+            
+            // アクセスカウントを取得
+            let access_count = page.access_count.load(Ordering::Relaxed);
+            
+            // アクセスパターンを取得
+            let pattern = locality::get_block_pattern(page.block_id)
+                .unwrap_or(AccessPattern::Random);
+            
+            // 最適なメモリ階層を判断
+            let optimal_tier = determine_optimal_tier(access_count, age_ms, pattern);
+            
+            // 現在と異なる階層が最適な場合、移行候補に追加
+            if optimal_tier != page.current_tier {
+                candidates.push(MigrationCandidate {
+                    page_idx: idx,
+                    virtual_address: page.virtual_address,
+                    physical_address: page.physical_address,
+                    current_tier: page.current_tier,
+                    target_tier: optimal_tier,
+                    access_count,
+                    age_ms,
+                    pattern,
+                    score: calculate_migration_score(access_count, age_ms, pattern, 
+                                                     page.current_tier, optimal_tier),
+                });
+            }
+        }
+        
+        // スコアでソート
+        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        
+        candidates
     }
 }
 
-/// テレページングを設定
-pub fn configure(options: TelepagingOptions) -> Result<(), &'static str> {
-    engine().configure(options)
+/// 追跡中のページ情報
+struct TrackedPage {
+    /// 仮想アドレス
+    virtual_address: usize,
+    /// 物理アドレス
+    physical_address: PhysicalAddress,
+    /// 現在のメモリ階層
+    current_tier: MemoryTier,
+    /// 最終アクセス時刻
+    last_access_time: u64,
+    /// アクセスカウント
+    access_count: AtomicUsize,
+    /// ホット判定回数
+    hot_count: AtomicUsize,
+    /// コールド判定回数
+    cold_count: AtomicUsize,
+    /// データブロックID
+    block_id: usize,
+    /// サイズ（通常はページサイズ）
+    size: usize,
 }
 
-/// ページアクセスを記録
-pub fn track_page_access(addr: usize) {
-    engine().track_page_access(addr)
+/// ページ移行候補
+struct MigrationCandidate {
+    /// ページインデックス
+    page_idx: usize,
+    /// 仮想アドレス
+    virtual_address: usize,
+    /// 物理アドレス
+    physical_address: PhysicalAddress,
+    /// 現在のメモリ階層
+    current_tier: MemoryTier,
+    /// ターゲットのメモリ階層
+    target_tier: MemoryTier,
+    /// アクセスカウント
+    access_count: usize,
+    /// 最終アクセスからの経過時間
+    age_ms: u64,
+    /// アクセスパターン
+    pattern: AccessPattern,
+    /// 移行スコア（高いほど優先）
+    score: f64,
 }
 
-/// ページフォルトを処理
-pub fn handle_page_fault(addr: usize) -> bool {
-    engine().handle_page_fault(addr)
+/// メモリ階層を判定
+fn get_memory_tier(phys_addr: PhysicalAddress) -> MemoryTier {
+    if hbm::is_hbm_address(phys_addr) {
+        MemoryTier::HighBandwidthMemory
+    } else {
+        MemoryTier::StandardDRAM
+    }
 }
 
-/// ホットページを予めロード
-pub fn preload_hot_pages() -> Result<usize, &'static str> {
-    engine().preload_hot_pages()
+/// 最適なメモリ階層を判断
+fn determine_optimal_tier(access_count: usize, age_ms: u64, pattern: AccessPattern) -> MemoryTier {
+    // ポリシーベースの判断
+    unsafe {
+        if let Some(telepage) = TELEPAGE.as_ref() {
+            return telepage.policy.determine_optimal_tier(access_count, age_ms, pattern);
+        }
+    }
+    
+    // デフォルト判断
+    if age_ms < 1000 && access_count > 10 {
+        // 直近でアクセスが多いページはHBMに
+        match pattern {
+            AccessPattern::Sequential | AccessPattern::Strided(_) => {
+                // シーケンシャル/ストライドアクセスはHBMで高速化
+                MemoryTier::HighBandwidthMemory
+            }
+            AccessPattern::Random => {
+                // ランダムアクセスは帯域幅の恩恵を受けやすい
+                if access_count > 100 {
+                    MemoryTier::HighBandwidthMemory
+        } else {
+                    MemoryTier::StandardDRAM
+                }
+            }
+            _ => MemoryTier::StandardDRAM,
+        }
+    } else {
+        // アクセスが古いか少ないページはDRAM
+        MemoryTier::StandardDRAM
+    }
 }
 
-/// メモリレイアウトを最適化
-pub fn optimize_page_layout() -> Result<usize, &'static str> {
-    engine().optimize_page_layout()
+/// 移行スコアを計算
+fn calculate_migration_score(access_count: usize, age_ms: u64, pattern: AccessPattern,
+                            current_tier: MemoryTier, target_tier: MemoryTier) -> f64 {
+    // ベーススコア: アクセス頻度
+    let base_score = if age_ms > 0 {
+        (access_count as f64) / ((age_ms as f64).max(1.0) / 1000.0)
+        } else {
+        access_count as f64
+    };
+    
+    // パターン係数
+    let pattern_factor = match pattern {
+        AccessPattern::Sequential => 1.5, // シーケンシャルはHBMで大幅に高速化
+        AccessPattern::Strided(_) => 1.3, // ストライドも高速化
+        AccessPattern::Random => 1.2,     // ランダムも高速化
+        _ => 1.0,
+    };
+    
+    // 階層遷移係数
+    let tier_factor = match (current_tier, target_tier) {
+        (MemoryTier::StandardDRAM, MemoryTier::HighBandwidthMemory) => {
+            // DRAMからHBMへのホット遷移
+            1.0
+        },
+        (MemoryTier::HighBandwidthMemory, MemoryTier::StandardDRAM) => {
+            // HBMからDRAMへのコールド遷移
+            if age_ms > 5000 { // 5秒以上アクセスがない
+                0.8
+            } else {
+                0.4 // HBMからの降格は慎重に
+            }
+        },
+        _ => 0.0, // 同一階層への移動は意味がない
+    };
+    
+    // 最終スコア計算
+    base_score * pattern_factor * tier_factor
 }
 
-/// テレページング統計を取得
-pub fn get_stats() -> (usize, usize, usize, f32, usize, usize) {
-    engine().get_stats()
+/// ページスキャンと移行
+fn scan_and_migrate_pages() {
+    unsafe {
+        if let Some(telepage) = TELEPAGE.as_mut() {
+            // 無効なら何もしない
+            if !telepage.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        
+            // アクセスパターンを分析して移行候補を特定
+            let candidates = telepage.tracker.analyze_pages();
+            
+            if candidates.is_empty() {
+                return;
+            }
+            
+            log::debug!("TelePage: {}個の移行候補を検出", candidates.len());
+            
+            // 一度の実行で移行するページ数を制限
+            let max_migrations = telepage.config.max_migrations_per_scan;
+            let migration_count = core::cmp::min(candidates.len(), max_migrations);
+            
+            // 最も優先度の高い候補から移行
+            for i in 0..migration_count {
+                let candidate = &candidates[i];
+                
+                match migrate_page(candidate, &telepage.config) {
+                    Ok(()) => {
+                        log::debug!("ページ移行成功: 0x{:x} ({:?} → {:?}), スコア={:.2}",
+                                  candidate.virtual_address,
+                                  candidate.current_tier,
+                                  candidate.target_tier,
+                                  candidate.score);
+                        
+                        // 統計情報を更新
+                        telepage.stats.record_migration_success(
+                            candidate.current_tier,
+                            candidate.target_tier
+                        );
+                        
+                        // 移行後にページの階層情報を更新
+                        if let Some(page) = telepage.tracker.tracked_pages.get_mut(candidate.page_idx) {
+                            page.current_tier = candidate.target_tier;
+                            
+                            // ホット/コールドカウントを更新
+                            if candidate.target_tier == MemoryTier::HighBandwidthMemory {
+                                page.hot_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+                                page.cold_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("ページ移行失敗: 0x{:x} ({:?} → {:?}): {}",
+                                 candidate.virtual_address,
+                                 candidate.current_tier,
+                                 candidate.target_tier,
+                                 e);
+                        
+                        // 統計情報を更新
+                        telepage.stats.record_migration_failure(
+                            candidate.current_tier,
+                            candidate.target_tier
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// ページ統計を取得
-pub fn get_page_counts() -> (usize, usize, usize) {
-    engine().get_page_counts()
-} 
+/// ページを新しいメモリ階層に移行
+fn migrate_page(candidate: &MigrationCandidate, config: &config::TelePageConfig) -> Result<(), &'static str> {
+    let source_tier = candidate.current_tier;
+    let target_tier = candidate.target_tier;
+    
+    log::debug!("ページ移行開始: アドレス=0x{:x}, {:?} -> {:?}", 
+               candidate.virtual_address, source_tier, target_tier);
+    
+    // 1. ターゲット階層でページを割り当て
+    let target_phys = allocate_page_in_tier(target_tier)?;
+    
+    // 2. データをコピー
+    unsafe {
+        let source_ptr = candidate.virtual_address as *const u8;
+        let target_ptr = target_phys.as_u64() as *mut u8;
+        core::ptr::copy_nonoverlapping(source_ptr, target_ptr, 4096);
+    }
+    
+    // 3. ページテーブルを更新してVMAをアンマップしてから新しい物理アドレスにマップ
+    // アトミックな操作でページフォルトを防ぐ
+    let mut page_table = arch::get_current_page_table();
+    page_table.unmap_page(candidate.virtual_address);
+    page_table.map_page(candidate.virtual_address, target_phys, PageFlags::READABLE | PageFlags::WRITABLE);
+    
+    // 4. TLBフラッシュ
+    arch::flush_tlb_page(candidate.virtual_address);
+    
+    // 5. 元のページを解放
+    memory::deallocate_page_in_tier(candidate.physical_address, source_tier);
+    
+    log::debug!("ページ移行完了: アドレス=0x{:x}", candidate.virtual_address);
+    Ok(())
+}
+
+/// 指定のメモリ階層にページを割り当て
+fn allocate_page_in_tier(tier: MemoryTier) -> Result<PhysicalAddress, &'static str> {
+    match tier {
+        MemoryTier::HighBandwidthMemory => {
+            // HBMから割り当て
+            let page_size = mm::get_page_size();
+            let hbm_ptr = hbm::allocate(page_size, hbm::HbmMemoryType::General, 0)
+                .ok_or("HBMメモリの割り当てに失敗しました")?;
+            Ok(hbm_ptr.as_ptr() as usize)
+        },
+        MemoryTier::StandardDRAM => {
+            // 標準DRAMから割り当て
+            mm::allocate_physical_page()
+        },
+        _ => {
+            // その他のティアはサポート外
+            Err("サポートされていないメモリ階層です")
+        }
+    }
+}
+
+/// 統計情報を取得
+pub fn get_stats() -> stats::TelePageStats {
+    unsafe {
+        if let Some(telepage) = TELEPAGE.as_ref() {
+            telepage.stats.clone()
+        } else {
+            stats::TelePageStats::new()
+        }
+    }
+}
+
+/// 現在の設定情報を取得
+pub fn get_config() -> config::TelePageConfig {
+    unsafe {
+        if let Some(telepage) = TELEPAGE.as_ref() {
+            telepage.config.clone()
+        } else {
+            config::TelePageConfig::default()
+        }
+    }
+}

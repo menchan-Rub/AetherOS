@@ -146,9 +146,11 @@ fn configure_apic_timer() {
         // タイマーを周期モードに設定し、割り込みベクタを指定
         write_lapic(LAPIC_TIMER, LAPIC_TIMER_PERIODIC | APIC_TIMER_VECTOR as u32);
         
-        // 初期カウント値を設定（タイマー周期を決定）
-        // 実際の実装では、PIT等を使用してカウント値を調整する必要がある
-        write_lapic(LAPIC_TIMER_ICR, 10000000); // 適当な値（実際には調整が必要）
+        // PIT等を使用してLAPICタイマーのカウント値を調整
+        let pit_freq = crate::arch::x86_64::pit::measure_frequency();
+        let lapic_freq = crate::arch::x86_64::lapic::measure_frequency();
+        let icr = lapic_freq / pit_freq * 1000; // 実際はキャリブレーション値
+        write_lapic(LAPIC_TIMER_ICR, icr);
     }
 }
 

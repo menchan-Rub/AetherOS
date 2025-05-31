@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use spin::Once;
 use log::{debug, info, warn};
+use super::{allocate_pages as buddy_allocate, free_pages as buddy_free};
+use crate::memory::{AllocFlags, PAGE_SIZE};
 
 /// グローバルバディアロケータ
 static BUDDY_ALLOCATOR: Once<Mutex<BuddyAllocator>> = Once::new();
@@ -51,94 +53,157 @@ pub fn init(memory_info: &MemoryInfo) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 基本的なページ割り当て関数
+/// 通常ページ（4KB）の割り当て
 /// 
 /// # 引数
-/// * `num_pages` - 割り当てるページ数
-/// 
-/// # 戻り値
-/// 割り当てられた物理アドレス、または失敗時は None
-pub fn allocate_pages(num_pages: usize) -> Option<usize> {
-    // デフォルトの割り当てフラグを使用
-    let flags = AllocationFlags::default();
-    allocate_pages_with_flags(num_pages, flags)
-}
-
-/// フラグ付きのページ割り当て関数
-/// 
-/// # 引数
-/// * `num_pages` - 割り当てるページ数
+/// * `count` - 割り当てるページ数
 /// * `flags` - 割り当てフラグ
+/// * `numa_node` - NUMAノード指定（0は自動選択）
 /// 
 /// # 戻り値
-/// 割り当てられた物理アドレス、または失敗時は None
-pub fn allocate_pages_with_flags(num_pages: usize, flags: AllocationFlags) -> Option<usize> {
-    if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-        warn!("バディアロケータが初期化されていません");
-        return None;
-    }
-    
-    let allocator = BUDDY_ALLOCATOR.get().unwrap().lock();
-    let addr = allocator.allocate_pages(num_pages, flags);
-    
-    if let Some(addr) = addr {
-        debug!("メモリ割り当て: アドレス={:#x}, ページ数={}", addr, num_pages);
-    } else {
-        warn!("メモリ割り当て失敗: ページ数={}", num_pages);
-    }
-    
-    addr
+/// * `Ok(usize)` - 割り当てられたメモリの物理アドレス
+/// * `Err(&'static str)` - エラーメッセージ
+#[inline]
+pub fn allocate_pages(count: usize, flags: AllocFlags, numa_node: u8) -> Result<usize, &'static str> {
+    // バディアロケータの実装に委譲
+    buddy_allocate(count, flags, numa_node)
 }
 
-/// ゼロ初期化されたページを割り当て
+/// 通常ページの解放
 /// 
 /// # 引数
-/// * `num_pages` - 割り当てるページ数
+/// * `address` - 解放するメモリの物理アドレス
+/// * `count` - 解放するページ数
 /// 
 /// # 戻り値
-/// 割り当てられたゼロ初期化された物理アドレス、または失敗時は None
-pub fn allocate_zeroed_pages(num_pages: usize) -> Option<usize> {
-    let mut flags = AllocationFlags::default();
-    flags.zero = true;
-    allocate_pages_with_flags(num_pages, flags)
+/// * `Ok(())` - 成功
+/// * `Err(&'static str)` - エラーメッセージ
+#[inline]
+pub fn free_pages(address: usize, count: usize) -> Result<(), &'static str> {
+    // バディアロケータの実装に委譲
+    buddy_free(address, count)
 }
 
-/// 連続した物理ページを割り当て
+/// 連続した物理ページの割り当て
 /// 
 /// # 引数
-/// * `num_pages` - 割り当てるページ数
+/// * `count` - 割り当てるページ数
+/// * `flags` - 割り当てフラグ
+/// * `numa_node` - NUMAノード指定（0は自動選択）
 /// 
 /// # 戻り値
-/// 割り当てられた連続した物理アドレス、または失敗時は None
-pub fn allocate_contiguous_pages(num_pages: usize) -> Option<usize> {
-    let mut flags = AllocationFlags::default();
-    flags.contiguous = true;
-    allocate_pages_with_flags(num_pages, flags)
+/// * `Ok(usize)` - 割り当てられたメモリの物理アドレス
+/// * `Err(&'static str)` - エラーメッセージ
+pub fn allocate_pages_contiguous(count: usize, flags: AllocFlags, numa_node: u8) -> Result<usize, &'static str> {
+    // CONTIGUOUSフラグを追加
+    let contiguous_flags = flags.merge(AllocFlags::CONTIGUOUS);
+    
+    // バディアロケータで割り当て
+    buddy_allocate(count, contiguous_flags, numa_node)
 }
 
-/// 物理ページを解放
+/// 指定アライメントを持つページの割り当て
 /// 
 /// # 引数
-/// * `addr` - 解放する物理アドレス
-/// * `num_pages` - 解放するページ数
+/// * `count` - 割り当てるページ数
+/// * `alignment` - アライメント（バイト単位、2の累乗である必要あり）
+/// * `flags` - 割り当てフラグ
+/// * `numa_node` - NUMAノード指定（0は自動選択）
 /// 
 /// # 戻り値
-/// 成功時は Ok(()), 失敗時はエラーメッセージ
-pub fn free_pages(addr: usize, num_pages: usize) -> Result<(), &'static str> {
-    if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-        return Err("バディアロケータが初期化されていません");
+/// * `Ok(usize)` - 割り当てられたメモリの物理アドレス
+/// * `Err(&'static str)` - エラーメッセージ
+pub fn allocate_pages_aligned(
+    count: usize,
+    alignment: usize,
+    flags: AllocFlags,
+    numa_node: u8,
+) -> Result<usize, &'static str> {
+    // アライメントが2の累乗かチェック
+    if !alignment.is_power_of_two() {
+        return Err("アライメントは2の累乗である必要があります");
     }
     
-    let allocator = BUDDY_ALLOCATOR.get().unwrap().lock();
-    let result = allocator.free_pages(addr, num_pages);
-    
-    if result.is_ok() {
-        debug!("メモリ解放: アドレス={:#x}, ページ数={}", addr, num_pages);
-    } else {
-        warn!("メモリ解放失敗: アドレス={:#x}, ページ数={}", addr, num_pages);
+    // アライメントがページサイズ以下の場合は通常の割り当て
+    if alignment <= PAGE_SIZE {
+        return buddy_allocate(count, flags, numa_node);
     }
     
-    result
+    // アライメントページ数を計算（ページサイズの倍数に変換）
+    let alignment_pages = alignment / PAGE_SIZE;
+    
+    // 必要なページを多めに割り当て
+    let extra_pages = alignment_pages - 1;
+    let alloc_count = count + extra_pages;
+    
+    // 多めに割り当て
+    let address = buddy_allocate(alloc_count, flags, numa_node)?;
+    
+    // アライメントを計算
+    let aligned_address = (address + alignment - 1) & !(alignment - 1);
+    
+    // アドレスが既にアライメントされている場合
+    if address == aligned_address {
+        return Ok(address);
+    }
+    
+    // 余分なページを解放（前方）
+    let front_waste = aligned_address - address;
+    if front_waste > 0 {
+        let front_waste_pages = front_waste / PAGE_SIZE;
+        if front_waste_pages > 0 {
+            buddy_free(address, front_waste_pages)?;
+        }
+    }
+    
+    // 余分なページを解放（後方）
+    let end_address = address + (alloc_count * PAGE_SIZE);
+    let aligned_end = aligned_address + (count * PAGE_SIZE);
+    let back_waste = end_address - aligned_end;
+    if back_waste > 0 {
+        let back_waste_pages = back_waste / PAGE_SIZE;
+        if back_waste_pages > 0 {
+            buddy_free(aligned_end, back_waste_pages)?;
+        }
+    }
+    
+    Ok(aligned_address)
+}
+
+/// ゼロクリアしたページの割り当て
+/// 
+/// # 引数
+/// * `count` - 割り当てるページ数
+/// * `flags` - 割り当てフラグ
+/// * `numa_node` - NUMAノード指定（0は自動選択）
+/// 
+/// # 戻り値
+/// * `Ok(usize)` - 割り当てられたメモリの物理アドレス
+/// * `Err(&'static str)` - エラーメッセージ
+pub fn allocate_zeroed_pages(count: usize, flags: AllocFlags, numa_node: u8) -> Result<usize, &'static str> {
+    // ZEROフラグを追加
+    let zero_flags = flags.merge(AllocFlags::ZERO);
+    
+    // バディアロケータで割り当て
+    buddy_allocate(count, zero_flags, numa_node)
+}
+
+/// DMA用ページの割り当て（32ビットアドレス空間内）
+/// 
+/// # 引数
+/// * `count` - 割り当てるページ数
+/// * `flags` - 割り当てフラグ
+/// * `numa_node` - NUMAノード指定（0は自動選択）
+/// 
+/// # 戻り値
+/// * `Ok(usize)` - 割り当てられたメモリの物理アドレス
+/// * `Err(&'static str)` - エラーメッセージ
+pub fn allocate_dma_pages(count: usize, flags: AllocFlags, numa_node: u8) -> Result<usize, &'static str> {
+    // DMAフラグを追加
+    let dma_flags = flags.merge(AllocFlags::DMA);
+    
+    // バディアロケータで割り当て
+    buddy_allocate(count, dma_flags, numa_node)
 }
 
 /// バイト数からページ数に変換

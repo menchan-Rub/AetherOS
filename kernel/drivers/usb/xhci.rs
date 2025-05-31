@@ -681,4 +681,529 @@ pub fn register_driver() -> Result<(), &'static str> {
     } else {
         Err("USBサブシステムが初期化されていません")
     }
+}
+
+/// USB転送の実行（実際の実装）
+pub fn execute_transfer(
+    &mut self,
+    endpoint_address: u8,
+    transfer_type: UsbTransferType,
+    data: &[u8],
+    timeout_ms: u32,
+) -> Result<usize, &'static str> {
+    log::debug!("USB転送実行開始: EP=0x{:x}, タイプ={:?}, サイズ={}", 
+               endpoint_address, transfer_type, data.len());
+    
+    // xHCI仕様に準拠した転送実装
+    
+    // 1. TRBリングの設定
+    let slot_id = self.get_slot_id_for_endpoint(endpoint_address)?;
+    let endpoint_context = self.get_endpoint_context(slot_id, endpoint_address)?;
+    
+    // 2. TRB（Transfer Request Block）の作成
+    let trb_ring = self.get_trb_ring(slot_id, endpoint_address)?;
+    let transfer_trbs = self.create_transfer_trbs(transfer_type, data, timeout_ms)?;
+    
+    // 3. TRBリングにエンキュー
+    for trb in &transfer_trbs {
+        trb_ring.enqueue_trb(trb)?;
+    }
+    
+    // 4. Doorbellレジスタを鳴らして転送開始
+    self.ring_doorbell(slot_id, endpoint_address)?;
+    
+    // 5. 転送完了待機
+    let completion_result = self.wait_for_transfer_completion(timeout_ms)?;
+    
+    // 6. 結果の処理
+    match completion_result.completion_code {
+        TrbCompletionCode::Success => {
+            log::debug!("USB転送成功: 転送バイト数={}", completion_result.transfer_length);
+            Ok(completion_result.transfer_length)
+        }
+        TrbCompletionCode::ShortPacket => {
+            log::debug!("USB転送完了（ショートパケット）: 転送バイト数={}", completion_result.transfer_length);
+            Ok(completion_result.transfer_length)
+        }
+        TrbCompletionCode::StallError => {
+            log::error!("USB転送失敗: STALLエラー");
+            Err("エンドポイントSTALLエラー")
+        }
+        TrbCompletionCode::TransactionError => {
+            log::error!("USB転送失敗: トランザクションエラー");
+            Err("USBトランザクションエラー")
+        }
+        TrbCompletionCode::BabbleDetectedError => {
+            log::error!("USB転送失敗: バブルエラー");
+            Err("USBバブルエラー")
+        }
+        _ => {
+            log::error!("USB転送失敗: 不明なエラー（コード: {:?}）", completion_result.completion_code);
+            Err("USB転送エラー")
+        }
+    }
+}
+
+fn get_slot_id_for_endpoint(&self, endpoint_address: u8) -> Result<u8, &'static str> {
+    // エンドポイントアドレスからスロットIDを取得
+    // 実装では、デバイス管理テーブルから検索
+    for (slot_id, device) in &self.device_slots {
+        if device.has_endpoint(endpoint_address) {
+            return Ok(*slot_id);
+        }
+    }
+    
+    Err("指定されたエンドポイントのデバイスが見つかりません")
+}
+
+fn get_endpoint_context(&self, slot_id: u8, endpoint_address: u8) -> Result<&EndpointContext, &'static str> {
+    let device = self.device_slots.get(&slot_id)
+        .ok_or("無効なスロットID")?;
+    
+    device.get_endpoint_context(endpoint_address)
+        .ok_or("エンドポイントコンテキストが見つかりません")
+}
+
+fn get_trb_ring(&mut self, slot_id: u8, endpoint_address: u8) -> Result<&mut TrbRing, &'static str> {
+    let device = self.device_slots.get_mut(&slot_id)
+        .ok_or("無効なスロットID")?;
+    
+    device.get_trb_ring_mut(endpoint_address)
+        .ok_or("TRBリングが見つかりません")
+}
+
+fn create_transfer_trbs(&self, transfer_type: UsbTransferType, data: &[u8], timeout_ms: u32) -> Result<Vec<TransferTrb>, &'static str> {
+    let mut trbs = Vec::new();
+    
+    match transfer_type {
+        UsbTransferType::Control => {
+            // Control転送用TRBシーケンス
+            trbs.extend(self.create_control_transfer_trbs(data)?);
+        }
+        UsbTransferType::Bulk => {
+            // Bulk転送用TRB
+            trbs.extend(self.create_bulk_transfer_trbs(data)?);
+        }
+        UsbTransferType::Interrupt => {
+            // Interrupt転送用TRB
+            trbs.extend(self.create_interrupt_transfer_trbs(data, timeout_ms)?);
+        }
+        UsbTransferType::Isochronous => {
+            // Isochronous転送用TRB
+            trbs.extend(self.create_isochronous_transfer_trbs(data)?);
+        }
+    }
+    
+    Ok(trbs)
+}
+
+fn create_control_transfer_trbs(&self, data: &[u8]) -> Result<Vec<TransferTrb>, &'static str> {
+    let mut trbs = Vec::new();
+    
+    if data.len() < 8 {
+        return Err("Controlリクエストが短すぎます");
+    }
+    
+    // Setup Stage TRB
+    let setup_trb = TransferTrb {
+        trb_type: TrbType::SetupStage,
+        data_buffer_pointer: data.as_ptr() as u64,
+        transfer_length: 8,
+        flags: TrbFlags::IMMEDIATE_DATA | TrbFlags::TRANSFER_TYPE_IN,
+        cycle_bit: true,
+    };
+    trbs.push(setup_trb);
+    
+    // Data Stage TRB (データがある場合)
+    if data.len() > 8 {
+        let data_trb = TransferTrb {
+            trb_type: TrbType::DataStage,
+            data_buffer_pointer: (data.as_ptr() as u64) + 8,
+            transfer_length: (data.len() - 8) as u32,
+            flags: TrbFlags::TRANSFER_TYPE_IN,
+            cycle_bit: true,
+        };
+        trbs.push(data_trb);
+    }
+    
+    // Status Stage TRB
+    let status_trb = TransferTrb {
+        trb_type: TrbType::StatusStage,
+        data_buffer_pointer: 0,
+        transfer_length: 0,
+        flags: TrbFlags::INTERRUPT_ON_COMPLETION,
+        cycle_bit: true,
+    };
+    trbs.push(status_trb);
+    
+    Ok(trbs)
+}
+
+fn create_bulk_transfer_trbs(&self, data: &[u8]) -> Result<Vec<TransferTrb>, &'static str> {
+    let mut trbs = Vec::new();
+    let max_transfer_size = 65536; // 64KB
+    
+    let mut remaining_data = data;
+    let mut data_ptr = data.as_ptr() as u64;
+    
+    while !remaining_data.is_empty() {
+        let chunk_size = remaining_data.len().min(max_transfer_size);
+        let is_last_chunk = chunk_size == remaining_data.len();
+        
+        let mut flags = TrbFlags::TRANSFER_TYPE_NORMAL;
+        if is_last_chunk {
+            flags |= TrbFlags::INTERRUPT_ON_COMPLETION;
+        }
+        
+        let bulk_trb = TransferTrb {
+            trb_type: TrbType::Normal,
+            data_buffer_pointer: data_ptr,
+            transfer_length: chunk_size as u32,
+            flags,
+            cycle_bit: true,
+        };
+        trbs.push(bulk_trb);
+        
+        remaining_data = &remaining_data[chunk_size..];
+        data_ptr += chunk_size as u64;
+    }
+    
+    Ok(trbs)
+}
+
+fn create_interrupt_transfer_trbs(&self, data: &[u8], timeout_ms: u32) -> Result<Vec<TransferTrb>, &'static str> {
+    let mut trbs = Vec::new();
+    
+    let interrupt_trb = TransferTrb {
+        trb_type: TrbType::Normal,
+        data_buffer_pointer: data.as_ptr() as u64,
+        transfer_length: data.len() as u32,
+        flags: TrbFlags::INTERRUPT_ON_COMPLETION | TrbFlags::INTERRUPT_ON_SHORT_PACKET,
+        cycle_bit: true,
+    };
+    trbs.push(interrupt_trb);
+    
+    Ok(trbs)
+}
+
+fn create_isochronous_transfer_trbs(&self, data: &[u8]) -> Result<Vec<TransferTrb>, &'static str> {
+    let mut trbs = Vec::new();
+    
+    // Isochronous転送の実装
+    // フレーム番号とタイミング情報を含める
+    let frame_number = self.get_current_frame_number();
+    
+    let iso_trb = TransferTrb {
+        trb_type: TrbType::Isoch,
+        data_buffer_pointer: data.as_ptr() as u64,
+        transfer_length: data.len() as u32,
+        flags: TrbFlags::INTERRUPT_ON_COMPLETION,
+        cycle_bit: true,
+    };
+    trbs.push(iso_trb);
+    
+    Ok(trbs)
+}
+
+fn ring_doorbell(&self, slot_id: u8, endpoint_address: u8) -> Result<(), &'static str> {
+    // Doorbellレジスタの計算
+    let doorbell_offset = slot_id as usize * 4;
+    let doorbell_address = self.doorbell_array_base + doorbell_offset;
+    
+    // エンドポイント番号の計算（xHCI仕様に準拠）
+    let endpoint_index = self.calculate_endpoint_index(endpoint_address);
+    
+    // Doorbellレジスタへの書き込み
+    unsafe {
+        core::ptr::write_volatile(doorbell_address as *mut u32, endpoint_index as u32);
+    }
+    
+    log::trace!("Doorbell送信: スロット={}, EP={}, インデックス={}", 
+               slot_id, endpoint_address, endpoint_index);
+    
+    Ok(())
+}
+
+fn calculate_endpoint_index(&self, endpoint_address: u8) -> u8 {
+    // xHCI仕様: EP0 OUT=1, EP0 IN=1, EP1 OUT=2, EP1 IN=3, ...
+    let endpoint_number = endpoint_address & 0x0F;
+    let direction = (endpoint_address & 0x80) >> 7;
+    
+    if endpoint_number == 0 {
+        1 // Control endpoints
+    } else {
+        (endpoint_number * 2) + direction
+    }
+}
+
+fn wait_for_transfer_completion(&mut self, timeout_ms: u32) -> Result<TransferCompletion, &'static str> {
+    let start_time = crate::time::current_time_ms();
+    let timeout_time = start_time + timeout_ms as u64;
+    
+    loop {
+        // イベントリングをポーリング
+        if let Some(event_trb) = self.poll_event_ring() {
+            if let Some(completion) = self.process_transfer_event(&event_trb) {
+                return Ok(completion);
+            }
+        }
+        
+        // タイムアウトチェック
+        if crate::time::current_time_ms() > timeout_time {
+            return Err("USB転送タイムアウト");
+        }
+        
+        // 短時間待機
+        crate::time::sleep_us(100);
+    }
+}
+
+fn poll_event_ring(&mut self) -> Option<EventTrb> {
+    // イベントリングのdequeue pointerをチェック
+    let current_trb = self.event_ring.get_current_trb();
+    
+    // Cycle bitをチェックして新しいイベントがあるか確認
+    if current_trb.is_valid() && current_trb.cycle_bit == self.event_ring.cycle_bit {
+        let event_trb = current_trb.clone();
+        self.event_ring.advance_dequeue_pointer();
+        Some(event_trb)
+    } else {
+        None
+    }
+}
+
+fn process_transfer_event(&self, event_trb: &EventTrb) -> Option<TransferCompletion> {
+    match event_trb.trb_type {
+        TrbType::TransferEvent => {
+            let completion = TransferCompletion {
+                completion_code: event_trb.completion_code,
+                transfer_length: event_trb.transfer_length,
+                slot_id: event_trb.slot_id,
+                endpoint_id: event_trb.endpoint_id,
+                event_data: event_trb.event_data,
+            };
+            Some(completion)
+        }
+        _ => None,
+    }
+}
+
+fn get_current_frame_number(&self) -> u32 {
+    // MFINDEXレジスタから現在のマイクロフレーム番号を取得
+    let mfindex_register = self.operational_registers_base + 0x440;
+    unsafe {
+        core::ptr::read_volatile(mfindex_register as *const u32) & 0x3FFF
+    }
+}
+
+// 追加のデータ構造とトレイト実装
+#[derive(Debug, Clone)]
+pub struct TransferTrb {
+    pub trb_type: TrbType,
+    pub data_buffer_pointer: u64,
+    pub transfer_length: u32,
+    pub flags: TrbFlags,
+    pub cycle_bit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventTrb {
+    pub trb_type: TrbType,
+    pub completion_code: TrbCompletionCode,
+    pub transfer_length: u32,
+    pub slot_id: u8,
+    pub endpoint_id: u8,
+    pub event_data: u64,
+    pub cycle_bit: bool,
+}
+
+impl EventTrb {
+    pub fn is_valid(&self) -> bool {
+        self.trb_type != TrbType::Reserved
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferCompletion {
+    pub completion_code: TrbCompletionCode,
+    pub transfer_length: usize,
+    pub slot_id: u8,
+    pub endpoint_id: u8,
+    pub event_data: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrbType {
+    Reserved = 0,
+    Normal = 1,
+    SetupStage = 2,
+    DataStage = 3,
+    StatusStage = 4,
+    Isoch = 5,
+    Link = 6,
+    EventData = 7,
+    NoOp = 8,
+    TransferEvent = 32,
+    CommandCompletion = 33,
+    PortStatusChange = 34,
+    BandwidthRequest = 35,
+    Doorbell = 36,
+    HostController = 37,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrbCompletionCode {
+    Success = 1,
+    DataBufferError = 2,
+    BabbleDetectedError = 3,
+    TransactionError = 4,
+    TrbError = 5,
+    StallError = 6,
+    ResourceError = 7,
+    BandwidthError = 8,
+    NoSlotsAvailableError = 9,
+    InvalidStreamTypeError = 10,
+    SlotNotEnabledError = 11,
+    EndpointNotEnabledError = 12,
+    ShortPacket = 13,
+    RingUnderrun = 14,
+    RingOverrun = 15,
+    VfEventRingFullError = 16,
+    ParameterError = 17,
+    BandwidthOverrunError = 18,
+    ContextStateError = 19,
+    NoPingResponseError = 20,
+    EventRingFullError = 21,
+    IncompatibleDeviceError = 22,
+    MissedServiceError = 23,
+    CommandRingStopped = 24,
+    CommandAborted = 25,
+    Stopped = 26,
+    StoppedLengthInvalid = 27,
+    StoppedShortPacket = 28,
+    MaxExitLatencyTooLargeError = 29,
+    IsochBufferOverrun = 31,
+    EventLostError = 32,
+    UndefinedError = 33,
+    InvalidStreamIdError = 34,
+    SecondaryBandwidthError = 35,
+    SplitTransactionError = 36,
+}
+
+bitflags::bitflags! {
+    pub struct TrbFlags: u32 {
+        const CYCLE_BIT = 1 << 0;
+        const EVALUATE_NEXT_TRB = 1 << 1;
+        const INTERRUPT_ON_SHORT_PACKET = 1 << 2;
+        const NO_SNOOP = 1 << 3;
+        const CHAIN_BIT = 1 << 4;
+        const INTERRUPT_ON_COMPLETION = 1 << 5;
+        const IMMEDIATE_DATA = 1 << 6;
+        const TRANSFER_TYPE_NORMAL = 0 << 16;
+        const TRANSFER_TYPE_IN = 1 << 16;
+        const TRANSFER_TYPE_OUT = 2 << 16;
+    }
+}
+
+impl UsbDevice {
+    pub fn has_endpoint(&self, endpoint_address: u8) -> bool {
+        self.endpoints.contains_key(&endpoint_address)
+    }
+    
+    pub fn get_endpoint_context(&self, endpoint_address: u8) -> Option<&EndpointContext> {
+        self.endpoints.get(&endpoint_address)
+    }
+    
+    pub fn get_trb_ring_mut(&mut self, endpoint_address: u8) -> Option<&mut TrbRing> {
+        if let Some(endpoint) = self.endpoints.get_mut(&endpoint_address) {
+            Some(&mut endpoint.trb_ring)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EndpointContext {
+    pub endpoint_type: EndpointType,
+    pub max_packet_size: u16,
+    pub max_burst_size: u8,
+    pub interval: u8,
+    pub trb_ring: TrbRing,
+}
+
+#[derive(Debug)]
+pub enum EndpointType {
+    Control,
+    IsochOut,
+    BulkOut,
+    InterruptOut,
+    IsochIn,
+    BulkIn,
+    InterruptIn,
+}
+
+#[derive(Debug)]
+pub struct TrbRing {
+    pub trbs: Vec<TransferTrb>,
+    pub enqueue_pointer: usize,
+    pub dequeue_pointer: usize,
+    pub cycle_bit: bool,
+}
+
+impl TrbRing {
+    pub fn enqueue_trb(&mut self, trb: &TransferTrb) -> Result<(), &'static str> {
+        if self.is_full() {
+            return Err("TRBリングが満杯です");
+        }
+        
+        self.trbs[self.enqueue_pointer] = trb.clone();
+        self.advance_enqueue_pointer();
+        Ok(())
+    }
+    
+    pub fn get_current_trb(&self) -> &TransferTrb {
+        &self.trbs[self.dequeue_pointer]
+    }
+    
+    pub fn advance_dequeue_pointer(&mut self) {
+        self.dequeue_pointer += 1;
+        if self.dequeue_pointer >= self.trbs.len() {
+            self.dequeue_pointer = 0;
+            self.cycle_bit = !self.cycle_bit;
+        }
+    }
+    
+    fn advance_enqueue_pointer(&mut self) {
+        self.enqueue_pointer += 1;
+        if self.enqueue_pointer >= self.trbs.len() {
+            self.enqueue_pointer = 0;
+        }
+    }
+    
+    fn is_full(&self) -> bool {
+        let next_enqueue = (self.enqueue_pointer + 1) % self.trbs.len();
+        next_enqueue == self.dequeue_pointer
+    }
+}
+
+#[derive(Debug)]
+pub struct EventRing {
+    pub events: Vec<EventTrb>,
+    pub dequeue_pointer: usize,
+    pub cycle_bit: bool,
+}
+
+impl EventRing {
+    pub fn get_current_trb(&self) -> &EventTrb {
+        &self.events[self.dequeue_pointer]
+    }
+    
+    pub fn advance_dequeue_pointer(&mut self) {
+        self.dequeue_pointer += 1;
+        if self.dequeue_pointer >= self.events.len() {
+            self.dequeue_pointer = 0;
+            self.cycle_bit = !self.cycle_bit;
+        }
+    }
 } 

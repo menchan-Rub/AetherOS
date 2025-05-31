@@ -15,6 +15,7 @@ use crate::core::memory::mm::mmap::{AddressSpace, MapPermissions, MmapError};
 use crate::core::memory::mm::page::{AllocFlags, Page, PAGE_SIZE};
 use crate::core::process::{Pid, ProcessId};
 use crate::core::sync::RwLock;
+use crate::time;
 
 /// テレページのメタデータヘッダ
 /// 共有メモリページの先頭に配置され、制御と同期に使用される
@@ -565,15 +566,19 @@ impl TelepageMeta {
 
 /// 現在のタイムスタンプを取得
 fn get_timestamp() -> u64 {
-    // TODO: 実際のタイムスタンプ取得処理
-    0
+    // システムの現在時刻をナノ秒精度で取得
+    crate::time::get_current_time().as_nanos()
 }
 
 impl ProcessId {
     /// u32からプロセスIDを作成
     fn as_u32(&self) -> u32 {
-        // TODO: 実際のProcessIdの実装に合わせる
-        self.into_raw() as u32
+        // プロセスIDを32ビット値として取得
+        // 内部実装がu64の場合は下位32ビットのみ使用
+        match self.0 {
+            Pid::Kernel(id) => (id & 0xFFFFFFFF) as u32,
+            Pid::User(id) => (id & 0xFFFFFFFF) as u32,
+        }
     }
 }
 

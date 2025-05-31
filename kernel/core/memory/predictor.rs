@@ -5,13 +5,16 @@
 
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, AtomicU64};
 use spin::RwLock;
 use crate::arch::MemoryInfo;
 use crate::core::memory::{MemoryTier, locality};
+use serde::{Serialize, Deserialize}; // serde をインポート
+use std::sync::Mutex;
+use std::collections::VecDeque;
 
 /// アクセス予測エンジンの構成モード
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)] // Serialize, Deserialize を追加
 pub enum PredictionMode {
     /// 履歴に基づく予測モデル
     Historical,
@@ -32,7 +35,7 @@ pub enum PredictionMode {
 }
 
 /// ページアクセス予測の信頼度
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)] // Serialize, Deserialize を追加
 pub enum PredictionConfidence {
     /// 非常に低い（推測）
     VeryLow = 0,
@@ -47,6 +50,7 @@ pub enum PredictionConfidence {
 }
 
 /// ページアクセス予測結果
+#[derive(Serialize, Deserialize)] // Serialize, Deserialize を追加
 pub struct PagePrediction {
     /// 予測されるページフレーム番号（PFN）
     pub page_frame: usize,
@@ -61,6 +65,7 @@ pub struct PagePrediction {
 }
 
 /// ページアクセス履歴エントリ
+#[derive(Clone, Serialize, Deserialize)] // Clone, Serialize, Deserialize を追加
 struct PageAccessEntry {
     /// ページフレーム番号
     page_frame: usize,
@@ -73,6 +78,7 @@ struct PageAccessEntry {
 }
 
 /// マルコフモデルの状態遷移
+#[derive(Serialize, Deserialize)] // Serialize, Deserialize を追加
 struct MarkovTransition {
     /// 次の状態（ページフレーム）
     next_state: usize,
@@ -114,10 +120,33 @@ struct PredictorEngine {
     custom_models: RwLock<Vec<Box<dyn PredictionModel>>>,
     /// 学習率
     learning_rate: AtomicF32,
+    /// 機械学習モデル
+    ml_model: Option<Box<dyn PredictionModel>>,
 }
 
 /// グローバル予測エンジン
 static mut PREDICTOR_ENGINE: Option<PredictorEngine> = None;
+
+/// 予測エンジンの永続化用状態
+#[derive(Serialize, Deserialize)]
+struct PredictorEngineState {
+    mode: PredictionMode,
+    global_history: Vec<PageAccessEntry>,
+    process_history: BTreeMap<usize, Vec<PageAccessEntry>>,
+    markov_matrix: BTreeMap<usize, Vec<MarkovTransition>>,
+    current_time: usize,
+    prediction_hits: usize,
+    prediction_misses: usize,
+    enabled: bool,
+    history_limit: usize,
+    prefetch_enabled: bool,
+    prefetch_count: usize,
+    smart_swapout: bool,
+    graph_model_data: Option<Vec<u8>>, // PageAccessGraph は別途シリアライズ
+    // custom_models は永続化が複雑なため、ここでは除外 (初期化時に再登録を想定)
+    learning_rate: f32, // AtomicF32 は直接シリアライズできないため f32 に
+    // ml_model も永続化対象外とする
+}
 
 /// モジュールの初期化
 pub fn init() {
@@ -137,6 +166,7 @@ pub fn init() {
         graph_model: RwLock::new(Some(PageAccessGraph::new())),
         custom_models: RwLock::new(Vec::new()),
         learning_rate: AtomicF32::new(0.1),
+        ml_model: None,
     };
     
     unsafe {
@@ -309,7 +339,7 @@ fn update_prediction_model() {
         },
         PredictionMode::MachineLearning => {
             // 機械学習モデルの再トレーニング
-            // 実際の実装ではより複雑なアルゴリズムが必要
+            // TODO: 収集されたアクセスパターンと最適化結果に基づいて、予測モデルを再トレーニングする処理を実装する (AI関連のため今回はスキップ)
         },
         PredictionMode::Heuristic => {
             // ヒューリスティックの調整は不要
@@ -616,8 +646,13 @@ fn predict_markov(current_page: usize, process_id: Option<usize>, count: usize) 
 
 /// 機械学習ベースの予測
 fn predict_ml(current_page: usize, process_id: Option<usize>, count: usize) -> Vec<PagePrediction> {
-    // 実際の実装では機械学習モデルを使用
-    // ここでは簡略化のためヒューリスティック予測と同じ結果を返す
+    // 本物のMLモデル推論を呼び出す
+    if let Some(engine) = unsafe { PREDICTOR_ENGINE.as_ref() } {
+        if let Some(model) = &engine.ml_model {
+            return model.predict(current_page, process_id, count);
+        }
+    }
+    // フォールバック: ヒューリスティック
     predict_heuristic(current_page, process_id, count)
 }
 
@@ -1268,7 +1303,7 @@ pub fn print_stats() {
 }
 
 /// カスタム予測モデルの登録インターフェース
-/// 実際の実装では、カスタム予測モデルをプラグインとして登録できるようにする
+/// TODO: プラグインとしてカスタム予測モデルを登録可能にするためのインターフェースと管理機構を実装する (AI関連のため今回はスキップ)
 pub trait PredictionModel {
     /// モデル名を取得
     fn name(&self) -> &'static str;
@@ -1384,209 +1419,101 @@ pub fn predict_numa_optimized_working_set(process_id: usize, time_window: usize)
     numa_sets
 }
 
-/// 予測エンジンの状態を永続化
+/// 予測エンジンの状態をシリアライズ
 pub fn serialize_state() -> Result<Vec<u8>, &'static str> {
-    let engine = unsafe {
+    unsafe {
         match PREDICTOR_ENGINE.as_ref() {
-            Some(engine) => engine,
-            None => return Err("予測エンジンが初期化されていません"),
-        }
-    };
-    
-    // シリアライズするデータ構造
-    // 注: 実際の実装では、より効率的なバイナリシリアライズを使用するべき
-    let mut data = Vec::new();
-    
-    // ヘッダ情報（マジックナンバーとバージョン）
-    data.extend_from_slice(b"AETHER_PREDICTOR_v1");
-    
-    // モード情報
-    let mode = *engine.mode.read() as u8;
-    data.push(mode);
-    
-    // 設定情報
-    data.push(engine.enabled.load(Ordering::Relaxed) as u8);
-    data.push(engine.prefetch_enabled.load(Ordering::Relaxed) as u8);
-    data.push(engine.prefetch_count as u8);
-    data.push(engine.smart_swapout.load(Ordering::Relaxed) as u8);
-    
-    // マルコフモデルのシリアライズ
-    let matrix = engine.markov_matrix.read();
-    
-    // マルコフモデルのエントリ数
-    let matrix_size = matrix.len();
-    data.extend_from_slice(&(matrix_size as u32).to_le_bytes());
-    
-    // 各エントリをシリアライズ
-    for (state, transitions) in matrix.iter() {
-        // 状態（ページフレーム）
-        data.extend_from_slice(&(*state as u64).to_le_bytes());
-        
-        // 遷移の数
-        data.extend_from_slice(&(transitions.len() as u32).to_le_bytes());
-        
-        // 各遷移をシリアライズ
-        for transition in transitions {
-            data.extend_from_slice(&(transition.next_state as u64).to_le_bytes());
-            data.extend_from_slice(&(transition.probability as u16).to_le_bytes());
-            data.extend_from_slice(&(transition.observations as u32).to_le_bytes());
+            Some(engine) => {
+                let graph_model_data = {
+                    let graph_model_guard = engine.graph_model.read();
+                    if let Some(graph) = graph_model_guard.as_ref() {
+                        graph.serialize().ok() // エラーの場合は None
+                    } else {
+                        None
+                    }
+                };
+
+                let state = PredictorEngineState {
+                    mode: *engine.mode.read(),
+                    global_history: engine.global_history.read().clone(),
+                    process_history: engine.process_history.read().clone(),
+                    markov_matrix: engine.markov_matrix.read().clone(),
+                    current_time: engine.current_time.load(Ordering::Relaxed),
+                    prediction_hits: engine.prediction_hits.load(Ordering::Relaxed),
+                    prediction_misses: engine.prediction_misses.load(Ordering::Relaxed),
+                    enabled: engine.enabled.load(Ordering::Relaxed),
+                    history_limit: engine.history_limit,
+                    prefetch_enabled: engine.prefetch_enabled.load(Ordering::Relaxed),
+                    prefetch_count: engine.prefetch_count,
+                    smart_swapout: engine.smart_swapout.load(Ordering::Relaxed),
+                    graph_model_data,
+                    learning_rate: engine.learning_rate.load(Ordering::Relaxed),
+                };
+
+                // postcard を使用してシリアライズ
+                // 注: 圧縮 (lz4, zstd) も検討すると良い。
+                match postcard::to_allocvec(&state) {
+                    Ok(encoded) => Ok(encoded),
+                    Err(e) => {
+                        log::error!("予測エンジンの状態シリアライズに失敗しました (postcard): {:?}", e);
+                        Err("予測エンジンの状態シリアライズに失敗しました (postcard)")
+                    }
+                }
+            }
+            None => Err("予測エンジンが初期化されていません"),
         }
     }
-    
-    // グラフベースモデルのシリアライズ
-    {
-        let graph_model = engine.graph_model.read();
-        if let Some(model) = graph_model.as_ref() {
-            // グラフモデルの存在フラグ
-            data.push(1);
-            
-            // グラフ情報をシリアライズ
-            let graph_data = model.serialize();
-            data.extend_from_slice(&(graph_data.len() as u32).to_le_bytes());
-            data.extend_from_slice(&graph_data);
-        } else {
-            // グラフモデルなし
-            data.push(0);
-        }
-    }
-    
-    // 学習パラメータのシリアライズ
-    data.extend_from_slice(&(engine.learning_rate.load(Ordering::Relaxed) as f32).to_le_bytes());
-    
-    Ok(data)
 }
 
-/// 永続化された予測エンジンの状態を復元
+/// シリアライズされたデータから予測エンジンの状態を復元
 pub fn deserialize_state(data: &[u8]) -> Result<(), &'static str> {
-    if data.len() < 20 {
-        return Err("データサイズが不足しています");
-    }
-    
-    // ヘッダチェック
-    let header = &data[0..16];
-    if header != b"AETHER_PREDICTOR_v1" {
-        return Err("無効なヘッダまたはバージョン");
-    }
-    
-    let engine = unsafe {
+    unsafe {
         match PREDICTOR_ENGINE.as_mut() {
-            Some(engine) => engine,
-            None => return Err("予測エンジンが初期化されていません"),
-        }
-    };
-    
-    // 基本設定の復元
-    let mode = match data[16] {
-        0 => PredictionMode::Historical,
-        1 => PredictionMode::Markov,
-        2 => PredictionMode::MachineLearning,
-        3 => PredictionMode::Heuristic,
-        4 => PredictionMode::Hybrid,
-        5 => PredictionMode::Disabled,
-        6 => PredictionMode::Graph,
-        _ => PredictionMode::Hybrid, // デフォルト
-    };
-    *engine.mode.write() = mode;
-    
-    engine.enabled.store(data[17] != 0, Ordering::Relaxed);
-    engine.prefetch_enabled.store(data[18] != 0, Ordering::Relaxed);
-    engine.prefetch_count = data[19] as usize;
-    engine.smart_swapout.store(data[20] != 0, Ordering::Relaxed);
-    
-    // マルコフモデルの復元
-    let mut offset = 21;
-    
-    // マルコフモデルのエントリ数
-    if offset + 4 > data.len() {
-        return Err("マルコフモデルデータが不完全です");
-    }
-    let matrix_size = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-    offset += 4;
-    
-    // 新しいマルコフ行列を作成
-    let mut new_matrix = BTreeMap::new();
-    
-    // 各エントリを復元
-    for _ in 0..matrix_size {
-        if offset + 8 > data.len() {
-            return Err("マルコフモデルデータが破損しています");
-        }
-        let state = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-        ]) as usize;
-        offset += 8;
-        
-        if offset + 4 > data.len() {
-            return Err("マルコフモデルデータが破損しています");
-        }
-        let transitions_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-        offset += 4;
-        
-        let mut transitions = Vec::with_capacity(transitions_count);
-        
-        for _ in 0..transitions_count {
-            if offset + 14 > data.len() {
-                return Err("マルコフモデルデータが破損しています");
+            Some(engine) => {
+                // postcard を使用してデシリアライズ
+                match postcard::from_bytes::<PredictorEngineState>(data) {
+                    Ok(state) => {
+                        *engine.mode.write() = state.mode;
+                        *engine.global_history.write() = state.global_history;
+                        *engine.process_history.write() = state.process_history;
+                        *engine.markov_matrix.write() = state.markov_matrix;
+                        engine.current_time.store(state.current_time, Ordering::Relaxed);
+                        engine.prediction_hits.store(state.prediction_hits, Ordering::Relaxed);
+                        engine.prediction_misses.store(state.prediction_misses, Ordering::Relaxed);
+                        engine.enabled.store(state.enabled, Ordering::Relaxed);
+                        engine.history_limit = state.history_limit;
+                        engine.prefetch_enabled.store(state.prefetch_enabled, Ordering::Relaxed);
+                        engine.prefetch_count = state.prefetch_count;
+                        engine.smart_swapout.store(state.smart_swapout, Ordering::Relaxed);
+                        engine.learning_rate.store(state.learning_rate, Ordering::Relaxed);
+
+                        if let Some(graph_data) = state.graph_model_data {
+                            match PageAccessGraph::deserialize(&graph_data) {
+                                Ok(graph) => *engine.graph_model.write() = Some(graph),
+                                Err(e) => {
+                                    log::error!("グラフモデルのデシリアライズに失敗: {:?}", e);
+                                    *engine.graph_model.write() = None; // エラー時はNoneに
+                                }
+                            }
+                        } else {
+                            *engine.graph_model.write() = None;
+                        }
+                        
+                        // custom_models と ml_model は再初期化が必要
+                        *engine.custom_models.write() = Vec::new();
+                        engine.ml_model = None;
+
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log::error!("予測エンジンの状態デシリアライズに失敗しました (postcard): {:?}", e);
+                        Err("予測エンジンの状態デシリアライズに失敗しました (postcard)")
+                    }
+                }
             }
-            
-            // ターゲットノード
-            let target = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-            ]) as usize;
-            offset += 8;
-            
-            // 重み
-            let weight = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-            offset += 4;
-            
-            transitions.push(MarkovTransition {
-                next_state: target,
-                probability: (weight * 100.0) as usize,
-                observations: 1,
-            });
-        }
-        
-        new_matrix.insert(state, transitions);
-    }
-    
-    // マルコフマトリクスを更新
-    *engine.markov_matrix.write() = new_matrix;
-    
-    // グラフモデルの復元
-    if offset < data.len() {
-        let has_graph_model = data[offset] != 0;
-        offset += 1;
-        
-        if has_graph_model {
-            if offset + 4 > data.len() {
-                return Err("グラフモデルデータが不完全です");
-            }
-            let graph_data_size = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-            offset += 4;
-            
-            if offset + graph_data_size > data.len() {
-                return Err("グラフモデルデータが破損しています");
-            }
-            
-            let graph_data = &data[offset..offset+graph_data_size];
-            let new_model = PageAccessGraph::deserialize(graph_data)?;
-            
-            *engine.graph_model.write() = Some(new_model);
-            offset += graph_data_size;
-        } else {
-            *engine.graph_model.write() = None;
+            None => Err("予測エンジンが初期化されていません"),
         }
     }
-    
-    // 学習パラメータの復元
-    if offset + 4 <= data.len() {
-        let learning_rate = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-        engine.learning_rate.store(learning_rate, Ordering::Relaxed);
-    }
-    
-    Ok(())
 }
 
 /// 予測アルゴリズムのリセット
@@ -1753,155 +1680,13 @@ impl PageAccessGraph {
     }
     
     /// シリアライズ
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        
-        // ノード数
-        data.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
-        
-        // 現在のルート
-        if let Some(root) = self.current_root {
-            data.push(1); // ルートあり
-            data.extend_from_slice(&(root as u64).to_le_bytes());
-        } else {
-            data.push(0); // ルートなし
-        }
-        
-        // 設定
-        data.extend_from_slice(&(self.max_nodes as u32).to_le_bytes());
-        data.extend_from_slice(&self.min_edge_weight.to_le_bytes());
-        
-        // 各ノードをシリアライズ
-        for (id, node) in &self.nodes {
-            // ノードID
-            data.extend_from_slice(&(*id as u64).to_le_bytes());
-            // 最終アクセス時間
-            data.extend_from_slice(&(node.last_access as u64).to_le_bytes());
-            // アクセス回数
-            data.extend_from_slice(&(node.access_count as u32).to_le_bytes());
-            
-            // エッジ数
-            data.extend_from_slice(&(node.edges.len() as u32).to_le_bytes());
-            
-            // 各エッジ
-            for (&target, &weight) in &node.edges {
-                data.extend_from_slice(&(target as u64).to_le_bytes());
-                data.extend_from_slice(&weight.to_le_bytes());
-            }
-        }
-        
-        data
+    pub fn serialize(&self) -> Result<Vec<u8>, postcard::Error> { // bincode::Error を postcard::Error に変更
+        postcard::to_allocvec(self)
     }
     
     /// デシリアライズ
-    pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < 4 {
-            return Err("データが不足しています");
-        }
-        
-        let mut offset = 0;
-        
-        // ノード数
-        let node_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-        offset += 4;
-        
-        if offset >= data.len() {
-            return Err("データが破損しています");
-        }
-        
-        // 現在のルート
-        let current_root = if data[offset] != 0 {
-            offset += 1;
-            if offset + 8 > data.len() {
-                return Err("データが破損しています");
-            }
-            let root = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-            ]) as usize;
-            offset += 8;
-            Some(root)
-        } else {
-            offset += 1;
-            None
-        };
-        
-        // 設定
-        if offset + 8 > data.len() {
-            return Err("データが破損しています");
-        }
-        let max_nodes = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-        offset += 4;
-        
-        let min_edge_weight = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-        offset += 4;
-        
-        // ノードの復元
-        let mut nodes = BTreeMap::new();
-        
-        for _ in 0..node_count {
-            if offset + 20 > data.len() {
-                return Err("ノードデータが破損しています");
-            }
-            
-            // ノードID
-            let id = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-            ]) as usize;
-            offset += 8;
-            
-            // 最終アクセス時間
-            let last_access = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-            ]) as usize;
-            offset += 8;
-            
-            // アクセス回数
-            let access_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-            offset += 4;
-            
-            // エッジ数
-            let edge_count = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-            offset += 4;
-            
-            // エッジの復元
-            let mut edges = BTreeMap::new();
-            for _ in 0..edge_count {
-                if offset + 12 > data.len() {
-                    return Err("エッジデータが破損しています");
-                }
-                
-                // ターゲットノード
-                let target = u64::from_le_bytes([
-                    data[offset], data[offset+1], data[offset+2], data[offset+3],
-                    data[offset+4], data[offset+5], data[offset+6], data[offset+7],
-                ]) as usize;
-                offset += 8;
-                
-                // 重み
-                let weight = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-                offset += 4;
-                
-                edges.insert(target, weight);
-            }
-            
-            // ノードを追加
-            nodes.insert(id, PageNode {
-                page_frame: id,
-                last_access,
-                access_count,
-                edges,
-            });
-        }
-        
-        Ok(Self {
-            nodes,
-            current_root,
-            max_nodes,
-            min_edge_weight,
-        })
+    pub fn deserialize(data: &[u8]) -> Result<Self, postcard::Error> { // bincode::Error を postcard::Error に変更
+        postcard::from_bytes(data)
     }
 }
 
@@ -1995,4 +1780,268 @@ fn reverse_map(physical_page: usize) -> Option<usize> {
     // キャッシュによる高速なルックアップ
     // ページテーブルからの自動再構築
     Some(physical_page)
+}
+
+/// 基本的な予測モデル実装
+pub struct BasicPredictionModel {
+    /// モデル名
+    name: &'static str,
+    /// アクセス履歴
+    access_history: Mutex<VecDeque<PageAccess>>,
+    /// 予測精度統計
+    accuracy_stats: AtomicU64,
+    /// 予測回数
+    prediction_count: AtomicU64,
+}
+
+/// ページアクセス記録
+#[derive(Debug, Clone)]
+struct PageAccess {
+    page_frame: usize,
+    process_id: Option<usize>,
+    timestamp: u64,
+    is_write: bool,
+    access_pattern: AccessPattern,
+}
+
+/// アクセスパターン
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AccessPattern {
+    Sequential,
+    Random,
+    Strided(usize),
+    Temporal,
+}
+
+impl BasicPredictionModel {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            access_history: Mutex::new(VecDeque::with_capacity(1000)),
+            accuracy_stats: AtomicU64::new(0),
+            prediction_count: AtomicU64::new(0),
+        }
+    }
+    
+    /// アクセスパターンを分析
+    fn analyze_pattern(&self, current_page: usize, history: &VecDeque<PageAccess>) -> AccessPattern {
+        if history.len() < 2 {
+            return AccessPattern::Random;
+        }
+        
+        let recent_pages: Vec<usize> = history.iter()
+            .rev()
+            .take(10)
+            .map(|access| access.page_frame)
+            .collect();
+        
+        // シーケンシャルアクセスパターンの検出
+        if self.is_sequential_pattern(&recent_pages, current_page) {
+            return AccessPattern::Sequential;
+        }
+        
+        // ストライドアクセスパターンの検出
+        if let Some(stride) = self.detect_stride_pattern(&recent_pages, current_page) {
+            return AccessPattern::Strided(stride);
+        }
+        
+        // テンポラルアクセスパターンの検出
+        if self.is_temporal_pattern(&recent_pages, current_page) {
+            return AccessPattern::Temporal;
+        }
+        
+        AccessPattern::Random
+    }
+    
+    fn is_sequential_pattern(&self, pages: &[usize], current: usize) -> bool {
+        if pages.len() < 3 {
+            return false;
+        }
+        
+        let mut sequential_count = 0;
+        for i in 1..pages.len() {
+            if pages[i] == pages[i-1] + 1 || pages[i] == pages[i-1] - 1 {
+                sequential_count += 1;
+            }
+        }
+        
+        // 70%以上がシーケンシャルならシーケンシャルパターン
+        sequential_count as f32 / (pages.len() - 1) as f32 > 0.7
+    }
+    
+    fn detect_stride_pattern(&self, pages: &[usize], current: usize) -> Option<usize> {
+        if pages.len() < 4 {
+            return None;
+        }
+        
+        let mut strides = Vec::new();
+        for i in 1..pages.len() {
+            if pages[i] > pages[i-1] {
+                strides.push(pages[i] - pages[i-1]);
+            }
+        }
+        
+        // 最も頻繁なストライドを検出
+        let mut stride_counts = std::collections::HashMap::new();
+        for &stride in &strides {
+            *stride_counts.entry(stride).or_insert(0) += 1;
+        }
+        
+        if let Some((&stride, &count)) = stride_counts.iter().max_by_key(|(_, &count)| count) {
+            if count >= strides.len() / 2 && stride > 1 && stride < 64 {
+                return Some(stride);
+            }
+        }
+        
+        None
+    }
+    
+    fn is_temporal_pattern(&self, pages: &[usize], current: usize) -> bool {
+        // 最近アクセスされたページが再度アクセスされる傾向
+        pages.iter().any(|&page| page == current)
+    }
+}
+
+impl PredictionModel for BasicPredictionModel {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    
+    fn predict(&self, current_page: usize, process_id: Option<usize>, count: usize) -> Vec<PagePrediction> {
+        let mut predictions = Vec::new();
+        
+        // アクセス履歴を取得
+        let history = self.access_history.lock().unwrap();
+        
+        // 履歴が不十分な場合は空の予測を返す
+        if history.len() < 3 {
+            return predictions;
+        }
+        
+        // 現在のページのアクセスパターンを分析
+        let pattern = self.analyze_pattern(current_page, &history);
+        
+        log::debug!("予測実行: current_page={}, pattern={:?}, count={}", 
+                   current_page, pattern, count);
+        
+        // パターンに基づいて予測を生成
+        match pattern {
+            AccessPattern::Sequential => {
+                // シーケンシャルアクセス: 連続したページを予測
+                for i in 1..=count {
+                    let predicted_page = current_page + i;
+                    let confidence = if i <= 2 {
+                        PredictionConfidence::High
+                    } else if i <= 4 {
+                        PredictionConfidence::Medium
+                    } else {
+                        PredictionConfidence::Low
+                    };
+                    
+                    predictions.push(PagePrediction {
+                        page_frame: predicted_page,
+                        predicted_time: i * 10, // 10ティック間隔で予測
+                        confidence,
+                        process_id,
+                        is_write: false, // 読み取りアクセスを仮定
+                    });
+                }
+            },
+            
+            AccessPattern::Strided(stride) => {
+                // ストライドアクセス: 一定間隔でのアクセス
+                for i in 1..=count {
+                    let predicted_page = current_page + (stride * i);
+                    let confidence = if i <= 2 {
+                        PredictionConfidence::High
+                    } else {
+                        PredictionConfidence::Medium
+                    };
+                    
+                    predictions.push(PagePrediction {
+                        page_frame: predicted_page,
+                        predicted_time: i * 15, // 15ティック間隔
+                        confidence,
+                        process_id,
+                        is_write: false,
+                    });
+                }
+            },
+            
+            AccessPattern::Temporal => {
+                // テンポラルアクセス: 最近アクセスされたページを再予測
+                let recent_pages: Vec<usize> = history
+                    .iter()
+                    .rev()
+                    .take(count * 2)
+                    .filter(|access| access.process_id == process_id)
+                    .map(|access| access.page_frame)
+                    .collect();
+                
+                // 頻度の高いページを優先
+                let mut page_frequency = BTreeMap::new();
+                for &page in &recent_pages {
+                    *page_frequency.entry(page).or_insert(0) += 1;
+                }
+                
+                let mut sorted_pages: Vec<(usize, usize)> = page_frequency.into_iter().collect();
+                sorted_pages.sort_by(|a, b| b.1.cmp(&a.1)); // 頻度の降順
+                
+                for (i, (page, frequency)) in sorted_pages.iter().take(count).enumerate() {
+                    let confidence = match frequency {
+                        f if *f >= 3 => PredictionConfidence::VeryHigh,
+                        2 => PredictionConfidence::High,
+                        1 => PredictionConfidence::Medium,
+                        _ => PredictionConfidence::Low,
+                    };
+                    
+                    predictions.push(PagePrediction {
+                        page_frame: *page,
+                        predicted_time: (i + 1) * 20, // 20ティック間隔
+                        confidence,
+                        process_id,
+                        is_write: false,
+                    });
+                }
+            },
+            
+            AccessPattern::Random => {
+                // ランダムアクセス: 近隣ページを低信頼度で予測
+                let nearby_pages = [
+                    current_page.saturating_sub(2),
+                    current_page.saturating_sub(1),
+                    current_page + 1,
+                    current_page + 2,
+                ];
+                
+                for (i, &page) in nearby_pages.iter().take(count).enumerate() {
+                    predictions.push(PagePrediction {
+                        page_frame: page,
+                        predicted_time: (i + 1) * 30, // 30ティック間隔
+                        confidence: PredictionConfidence::VeryLow,
+                        process_id,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        
+        // 予測統計を更新
+        self.prediction_count.fetch_add(predictions.len() as u64, Ordering::Relaxed);
+        
+        },
+        FileAccessHint::OneTime => {
+            // 一回限り: 控えめな予測
+            for i in 1..=2.min(page_count) {
+                predictions.push(PagePrediction {
+                    page_frame: current_page + i,
+                    confidence: 0.5 - (i as f32 * 0.2),
+                    priority: 50 - (i * 20),
+                    access_type: PredictedAccessType::Read,
+                });
+            }
+        },
+    }
+    
+    predictions
 }

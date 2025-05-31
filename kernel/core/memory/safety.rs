@@ -557,7 +557,7 @@ pub fn track_allocation(addr: usize, size: usize) {
     let safety_level = *SAFETY_MANAGER.safety_level.read();
     if safety_level == SafetyLevel::Strict || safety_level == SafetyLevel::Debug {
         // ページのアクセス属性を変更して書き込み監視を有効化
-        // 実際の実装では、ページごとに設定が必要
+        // アーキテクチャ固有のページテーブル操作でW（書き込み）ビットをクリア
         let page_size = PageSize::Default as usize;
         let aligned_addr = addr & !(page_size - 1);
         let end_addr = addr + size;
@@ -865,4 +865,75 @@ pub fn enable_null_pointer_protection() -> Result<(), &'static str> {
 pub fn set_verification_enabled(enabled: bool) {
     SAFETY_MANAGER.verification_enabled.store(enabled, Ordering::Relaxed);
     log::info!("メモリ安全性検証: {}", if enabled { "有効" } else { "無効" });
+}
+
+fn enable_write_monitoring(&self, start_addr: usize, size: usize) -> Result<(), &'static str> {
+    // ページのアクセス属性を変更して書き込み監視を有効化
+    // アーキテクチャ固有のページテーブル操作でW（書き込み）ビットをクリア
+    let page_size = PageSize::Default as usize;
+    let num_pages = (size + page_size - 1) / page_size; // 切り上げ
+
+    // 現在のプロセスのページテーブルルートを取得する必要がある。
+    // これはプロセスコンテキストや現在のCPUの状態から取得する。
+    // ここではダミーとして 0 を使用するが、実際には適切な値を取得する。
+    // 例: let page_table_root = crate::core::process::current_process().page_table.get_root();
+    // page_table_root は PhysicalAddress 型を期待する。
+    // また、paging::change_permissions は bool を返すため、エラー処理も適切に行う。
+
+    // ダミーのページテーブルルート（実際には現在のプロセスから取得）
+    let current_page_table_root = crate::arch::mm::paging::current_page_table_root();
+
+    // 各ページに対して書き込み権限を削除 (読み取りは維持)
+    // 権限フラグの具体的な値はアーキテクチャや mmap::prot の定義に依存する。
+    // ここでは、読み取り可能、書き込み不可、実行不可、ユーザーページを想定する。
+    // (mmap::prot::READ) のようなフラグを使用するのが望ましい。
+    // 既存の権限を取得し、書き込みビットのみをクリアする方法も考えられる。
+    let new_permissions = mm::mmap::prot::READ; // 読み取りのみ許可
+
+    for i in 0..num_pages {
+        let current_vaddr = crate::arch::VirtualAddress::new((start_addr + i * page_size) as u64);
+        if !mm::paging::change_permissions(
+            current_page_table_root, 
+            current_vaddr, 
+            1, 
+            PageSize::Default, 
+            new_permissions
+        ) {
+            log::warn!(
+                "Failed to change permissions for write monitoring at {:#x}", 
+                current_vaddr
+            );
+            // 一つのページでも失敗したらエラーとするか、継続するかは設計次第
+            return Err("Failed to set page read-only for write monitoring");
+        }
+    }
+    log::debug!("Write monitoring enabled for range {:#x} - {:#x}", start_addr, start_addr + size);
+    Ok(())
+} 
+
+unsafe fn enable_write_monitoring_for_region(&self, start_addr: usize, size: usize) {
+    // ... 既存のロックとチェック ...
+    for i in 0..num_pages {
+        let current_addr = start_addr + i * page_size;
+        // ページのアクセス属性を変更して書き込み監視を有効化
+        // TODO: ページテーブルを操作して該当ページの書き込み保護を有効にする
+        // 例: x86_64ではPTEのR/Wビットをクリアし、Pビットをセットしたままにする
+        // 必要に応じてTLBフラッシュを行う
+        // self.set_page_write_protected(current_addr);
+        self.monitored_regions.lock().push(current_addr..current_addr + page_size);
+        log::trace!("Enabled write monitoring for page: {:#x}", current_addr);
+    }
+}
+
+unsafe fn enable_write_monitoring_for_address(&self, address: usize) {
+    let page_size = PageSize::Default as usize;
+    let page_start_addr = address & !(page_size - 1);
+
+    // ページのアクセス属性を変更して書き込み監視を有効化
+    // TODO: ページテーブルを操作して該当ページの書き込み保護を有効にする
+    // 例: x86_64ではPTEのR/Wビットをクリアし、Pビットをセットしたままにする
+    // 必要に応じてTLBフラッシュを行う
+    // self.set_page_write_protected(page_start_addr);
+    self.monitored_addresses.lock().push(page_start_addr);
+    log::trace!("Enabled write monitoring for page containing address: {:#x}", page_start_addr);
 } 

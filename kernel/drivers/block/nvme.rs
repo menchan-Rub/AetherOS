@@ -17,6 +17,9 @@ use spin::{Mutex, RwLock};
 use crate::drivers::pci::{PciDevice, PciClass};
 use crate::mm::{MemoryManager, PhysAddr, VirtAddr};
 use crate::sync::OnceCell;
+use crate::arch::timer;
+use crate::arch::cpu;
+use crate::time;
 
 /// NVMeレジスタオフセット
 const NVME_REG_CAP: usize = 0x0000;       // Controller Capabilities
@@ -473,9 +476,21 @@ impl NvmeController {
         // コントローラーを有効化
         self.enable_controller(&registers)?;
         
-        // コントローラー情報を取得（Identify Controller）
-        // TODO: Identify Controllerコマンドを実装
-        
+        // Identify Controllerコマンドを実装
+        let identify_data = self.identify_controller()?;
+
+        // コントローラー情報を表示
+        log::info!(
+            "NVMe Controller: {} (Vendor ID: {:X}, S/N: {}, FW: {})",
+            identify_data.get_model_number(),
+            identify_data.vid,
+            identify_data.get_serial_number(),
+            identify_data.get_firmware_revision()
+        );
+
+        // 10ミリ秒待機
+        time::sleep_ms(10);
+
         // レジスタを保存
         *self.registers.lock() = Some(registers);
         
@@ -498,10 +513,7 @@ impl NvmeController {
             let mut timeout = 500; // 最大5秒待機
             while (registers.get_csts() & NVME_CSTS_RDY) != 0 && timeout > 0 {
                 // 10ミリ秒待機
-                // TODO: スリープ関数を実装
-                for _ in 0..1000000 {
-                    core::hint::spin_loop();
-                }
+                time::sleep_ms(10);
                 timeout -= 1;
             }
             
@@ -555,10 +567,7 @@ impl NvmeController {
         let mut timeout = 500; // 最大5秒待機
         while (registers.get_csts() & NVME_CSTS_RDY) == 0 && timeout > 0 {
             // 10ミリ秒待機
-            // TODO: スリープ関数を実装
-            for _ in 0..1000000 {
-                core::hint::spin_loop();
-            }
+            time::sleep_ms(10);
             timeout -= 1;
         }
         
@@ -572,6 +581,239 @@ impl NvmeController {
     /// 次のコマンドIDを取得
     fn get_next_cmd_id(&self) -> u16 {
         (self.next_cmd_id.fetch_add(1, Ordering::Relaxed) % 0xFFFF) as u16
+    }
+
+    // Identify Controllerコマンドを実装
+    fn identify_controller(&self) -> Result<NvmeIdCtrl, &'static str> {
+        // コマンドIDを取得
+        let cid = self.get_next_cmd_id();
+        
+        // DMA可能なメモリ領域を確保（4KBアライメント）
+        let (virt_addr, phys_addr) = MemoryManager::allocate_dma_buffer(4096)
+            .map_err(|_| "Identify DMAバッファの割り当てに失敗しました")?;
+        
+        // メモリをゼロクリア
+        unsafe {
+            core::ptr::write_bytes(virt_addr as *mut u8, 0, 4096);
+        }
+        
+        // NVMe Identify Controllerコマンドを作成
+        let mut command = NvmeCommand::new();
+        command.set_opcode_and_cid(NVME_ADMIN_CMD_IDENTIFY, cid);
+        command.set_nsid(0); // コントローラーIDの場合は0
+        command.set_prp_entries(phys_addr, 0);
+        command.cdw10 = 1; // CNS=1: コントローラ構造体を返す
+        
+        if let Some(registers) = self.registers.lock().as_ref() {
+            // Admin Submission Queueを取得
+            let mut admin_sq = registers.admin_sq.lock();
+            let mut admin_cq = registers.admin_cq.lock();
+            
+            if let (Some(sq), Some(cq)) = (admin_sq.as_mut(), admin_cq.as_mut()) {
+                // キューがいっぱいでないことを確認
+                if sq.is_full() {
+                    return Err("Admin Submission Queueがいっぱいです");
+                }
+                
+                // コマンドをキューに書き込み
+                let sq_tail = sq.tail.load(Ordering::Relaxed);
+                let cmd_offset = sq_tail as usize * std::mem::size_of::<NvmeCommand>();
+                
+                unsafe {
+                    let cmd_ptr = (sq.virt_addr + cmd_offset) as *mut NvmeCommand;
+                    *cmd_ptr = command;
+                }
+                
+                // テールポインタを更新
+                let new_tail = (sq_tail + 1) % sq.size;
+                sq.tail.store(new_tail, Ordering::Release);
+                
+                // ドアベルを鳴らす
+                registers.ring_sq_doorbell(0, new_tail);
+                
+                // コマンド完了を待機（タイムアウト付き）
+                let mut timeout = 5000; // 5秒
+                let mut status = 0;
+                
+                while timeout > 0 {
+                    // Completion Queueをチェック
+                    let cq_head = cq.head.load(Ordering::Relaxed);
+                    let phase = cq.phase.load(Ordering::Relaxed);
+                    
+                    // 完了エントリをスキャン
+                    let mut found = false;
+                    let mut entry_idx = cq_head;
+                    
+                    loop {
+                        let entry_offset = entry_idx as usize * std::mem::size_of::<NvmeCompletion>();
+                        let completion: NvmeCompletion = unsafe {
+                            *(cq.virt_addr + entry_offset) as *const NvmeCompletion
+                        };
+                        
+                        // フェーズビットをチェック（エントリが有効か）
+                        let entry_phase = (completion.status & 1) != 0;
+                        if entry_phase != phase {
+                            break; // このエントリはまだ更新されていない
+                        }
+                        
+                        // このエントリがTargetのコマンドの完了か確認
+                        if completion.cid == cid {
+                            found = true;
+                            status = completion.status >> 1; // ステータスコード（フェーズビットを除く）
+                            break;
+                        }
+                        
+                        // 次のエントリをチェック
+                        entry_idx = (entry_idx + 1) % cq.size;
+                        if entry_idx == cq_head {
+                            break; // 一周した
+                        }
+                    }
+
+                    if found {
+                        // 完了エントリが見つかった
+                        if status == 0 {
+                            // 成功！IdCtrl構造体を構築
+                            let id_ctrl = unsafe {
+                                // DMAバッファからIdCtrl構造体を安全に作成
+                                let mut id_ctrl: NvmeIdCtrl = core::mem::zeroed();
+                                
+                                // メモリ境界チェック
+                                if virt_addr.is_null() {
+                                    log::error!("DMAバッファの仮想アドレスがnullです");
+                                    MemoryManager::free_dma_buffer(virt_addr, phys_addr, 4096);
+                                    return Err("DMAバッファエラー");
+                                }
+                                
+                                // アライメントチェック
+                                if (virt_addr as usize) % core::mem::align_of::<NvmeIdCtrl>() != 0 {
+                                    log::warn!("DMAバッファのアライメントが不正です");
+                                }
+                                
+                                // サイズチェック
+                                let copy_size = core::cmp::min(
+                                    core::mem::size_of::<NvmeIdCtrl>(),
+                                    4096
+                                );
+                                
+                                // 安全なメモリコピー
+                                core::ptr::copy_nonoverlapping(
+                                    virt_addr as *const u8,
+                                    &mut id_ctrl as *mut NvmeIdCtrl as *mut u8,
+                                    copy_size
+                                );
+                                
+                                // データ整合性チェック
+                                if id_ctrl.vid == 0 && id_ctrl.ssvid == 0 {
+                                    log::warn!("Identify Controllerデータが無効な可能性があります");
+                                }
+                                
+                                id_ctrl
+                            };
+                            
+                            // ヘッドポインタを更新
+                            let new_head = (entry_idx + 1) % cq.size;
+                            cq.head.store(new_head, Ordering::Release);
+                            
+                            // ドアベルを鳴らす（メモリバリア付き）
+                            core::sync::atomic::fence(Ordering::SeqCst);
+                            registers.ring_cq_doorbell(0, new_head);
+                            
+                            // DMAバッファを安全に解放
+                            if let Err(e) = MemoryManager::free_dma_buffer(virt_addr, phys_addr, 4096) {
+                                log::warn!("DMAバッファの解放に失敗: {:?}", e);
+                            }
+                            
+                            log::debug!("Identify Controller完了: VID=0x{:04x}, Model={}", 
+                                       id_ctrl.vid, id_ctrl.get_model_number());
+                            
+                            return Ok(id_ctrl);
+                        } else {
+                            // エラー処理の詳細化
+                            let status_code_type = (status >> 9) & 0x7;
+                            let status_code = status & 0xFF;
+                            
+                            log::error!("Identify Controllerコマンドが失敗: Type={}, Code=0x{:02x}", 
+                                       status_code_type, status_code);
+                            
+                            // エラータイプ別の詳細ログ
+                            match status_code_type {
+                                0 => log::error!("Generic Command Status"),
+                                1 => log::error!("Command Specific Status"),
+                                2 => log::error!("Media and Data Integrity Errors"),
+                                3 => log::error!("Path Related Status"),
+                                _ => log::error!("Unknown Status Type"),
+                            }
+                            
+                            // DMAバッファを解放
+                            if let Err(e) = MemoryManager::free_dma_buffer(virt_addr, phys_addr, 4096) {
+                                log::warn!("DMAバッファの解放に失敗: {:?}", e);
+                            }
+                            
+                            return Err("Identify Controllerコマンドが失敗しました");
+                        }
+                    }
+
+                    // まだ完了していない - プロセッサ負荷軽減
+                    if timeout % 100 == 0 {
+                        // 100ms毎にログ出力
+                        log::trace!("Identify Controller待機中... (残り{}ms)", timeout);
+                    }
+                    
+                    // CPUを他のタスクに譲る
+                    crate::scheduler::yield_cpu();
+                    time::sleep_ms(1);
+                    timeout -= 1;
+                }
+
+                // タイムアウト処理
+                log::error!("Identify Controllerコマンドがタイムアウトしました ({}ms)", 5000);
+                
+                // タイムアウト時のクリーンアップ
+                if let Err(e) = MemoryManager::free_dma_buffer(virt_addr, phys_addr, 4096) {
+                    log::error!("タイムアウト時のDMAバッファ解放に失敗: {:?}", e);
+                }
+                
+                // コントローラーの状態をチェック
+                let csts = registers.get_csts();
+                if (csts & 0x1) == 0 {
+                    log::error!("コントローラーが無効状態になりました: CSTS=0x{:08x}", csts);
+                    return Err("コントローラーエラー");
+                }
+                
+                return Err("Identify Controllerコマンドがタイムアウトしました");
+            } else {
+                log::error!("Admin Queueが初期化されていません");
+                return Err("Admin Queueが初期化されていません");
+            }
+        } else {
+            log::error!("NVMeレジスタが初期化されていません");
+            return Err("NVMeレジスタが初期化されていません");
+        }
+    }
+}
+
+/// NvmeIdCtrl構造体にヘルパーメソッドを追加
+impl NvmeIdCtrl {
+    /// モデル番号を文字列として取得
+    pub fn get_model_number(&self) -> &str {
+        let bytes = &self.mn[..];
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("Unknown").trim()
+    }
+
+    /// シリアル番号を文字列として取得
+    pub fn get_serial_number(&self) -> &str {
+        let bytes = &self.sn[..];
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("Unknown").trim()
+    }
+
+    /// ファームウェアリビジョンを文字列として取得
+    pub fn get_firmware_revision(&self) -> &str {
+        let bytes = &self.fr[..];
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("Unknown").trim()
     }
 }
 

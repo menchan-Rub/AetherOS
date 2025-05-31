@@ -10,6 +10,7 @@ use crate::core::memory::vmem::VMemMapper;
 use crate::drivers::pci::address::PciAddress;
 use core::ptr::{read_volatile, write_volatile};
 use log::{debug, warn};
+use acpi;
 
 /// PCIコンフィギュレーション空間アクセス方法の列挙型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,4 +505,311 @@ pub fn create_pci_config_accessor() -> Box<dyn PciConfigAccess> {
     // MMIOが利用できない場合はI/Oポートアクセサを使用
     debug!("PCIレガシーI/Oポートアクセサを使用します");
     Box::new(IoPortPciAccess::new())
+}
+
+fn get_pcie_config_base_from_acpi() -> Option<u64> {
+    // ACPI MCFGテーブルをパース
+    if let Some(mcfg) = acpi::find_table("MCFG") {
+        let base = u64::from_le_bytes(mcfg[44..52].try_into().unwrap());
+        Some(base)
+    } else {
+        None
+    }
+}
+
+pub fn create_ecam_accessor() -> Result<EcamConfigAccessor, &'static str> {
+    log::info!("ECamアクセサー作成開始");
+    
+    // ACPIテーブルからPCIeコンフィギュレーション空間の物理ベースアドレスを取得
+    let mcfg_table = crate::acpi::get_mcfg_table()
+        .ok_or("MCFGテーブルが見つかりません")?;
+    
+    let mut config_regions = Vec::new();
+    
+    // MCFGテーブルから設定領域を解析
+    for config_entry in mcfg_table.configuration_space_entries() {
+        let base_address = config_entry.base_address;
+        let segment_group = config_entry.pci_segment_group;
+        let start_bus = config_entry.start_pci_bus_number;
+        let end_bus = config_entry.end_pci_bus_number;
+        
+        log::debug!("PCIe設定領域: ベース=0x{:x}, セグメント={}, バス={}..{}", 
+                   base_address, segment_group, start_bus, end_bus);
+        
+        // 物理メモリ領域のサイズ計算
+        let bus_count = (end_bus - start_bus + 1) as usize;
+        let region_size = bus_count * 256 * 32 * 4096; // バス数 * デバイス数 * 機能数 * 4KB
+        
+        // 仮想メモリマッパーの作成
+        let vmem_mapper = VMemMapper::new(base_address, region_size)?;
+        
+        // 仮想アドレス空間にマッピング
+        let virtual_base = vmem_mapper.map_physical_region(
+            base_address,
+            region_size,
+            MemoryFlags::READABLE | MemoryFlags::WRITABLE | MemoryFlags::CACHE_DISABLE
+        )?;
+        
+        let region = EcamRegion {
+            physical_base: base_address,
+            virtual_base,
+            size: region_size,
+            segment_group,
+            start_bus_number: start_bus,
+            end_bus_number: end_bus,
+            mapper: vmem_mapper,
+        };
+        
+        config_regions.push(region);
+    }
+    
+    if config_regions.is_empty() {
+        return Err("有効なPCIe設定領域が見つかりません");
+    }
+    
+    let accessor = EcamConfigAccessor {
+        regions: config_regions,
+        access_stats: AccessStatistics::new(),
+    };
+    
+    log::info!("ECamアクセサー作成完了: {}個の設定領域", accessor.regions.len());
+    Ok(accessor)
+}
+
+fn find_region_for_address(&self, segment: u16, bus: u8, device: u8, function: u8) -> Option<&EcamRegion> {
+    for region in &self.regions {
+        if region.segment_group == segment &&
+           bus >= region.start_bus_number &&
+           bus <= region.end_bus_number {
+            return Some(region);
+        }
+    }
+    None
+}
+
+fn calculate_config_address(&self, region: &EcamRegion, bus: u8, device: u8, function: u8, offset: u16) -> Result<usize, &'static str> {
+    // PCIeアドレス計算: base + (bus << 20) + (device << 15) + (function << 12) + offset
+    if device >= 32 {
+        return Err("デバイス番号が範囲外です");
+    }
+    if function >= 8 {
+        return Err("機能番号が範囲外です");
+    }
+    if offset >= 4096 {
+        return Err("オフセットが範囲外です");
+    }
+    
+    let bus_offset = (bus - region.start_bus_number) as usize;
+    let config_offset = (bus_offset << 20) | ((device as usize) << 15) | ((function as usize) << 12) | (offset as usize);
+    
+    if config_offset >= region.size {
+        return Err("計算されたアドレスが領域外です");
+    }
+    
+    Ok(region.virtual_base + config_offset)
+}
+
+impl VMemMapper {
+    pub fn new(physical_base: u64, size: usize) -> Result<Self, &'static str> {
+        let mapper = VMemMapper {
+            physical_base,
+            virtual_base: 0, // map_physical_regionで設定
+            size,
+            page_table_entries: Vec::new(),
+        };
+        
+        Ok(mapper)
+    }
+
+    pub fn map_physical_region(&mut self, physical_addr: u64, size: usize, flags: MemoryFlags) -> Result<usize, &'static str> {
+        // ページアラインメントの確認
+        let aligned_addr = physical_addr & !0xFFF;
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        
+        // 仮想アドレス空間から適切な領域を見つける
+        let virtual_addr = self.find_available_virtual_region(aligned_size)?;
+        
+        // ページテーブルエントリの作成と設定
+        let page_count = aligned_size / 4096;
+        let mut current_phys = aligned_addr;
+        let mut current_virt = virtual_addr;
+        
+        for _ in 0..page_count {
+            // ページテーブルエントリの作成
+            let pte = PageTableEntry {
+                virtual_address: current_virt,
+                physical_address: current_phys,
+                flags: self.convert_memory_flags_to_page_flags(flags),
+            };
+            
+            // ページテーブルに登録
+            self.map_page(&pte)?;
+            self.page_table_entries.push(pte);
+            
+            current_phys += 4096;
+            current_virt += 4096;
+        }
+        
+        self.virtual_base = virtual_addr;
+        
+        // TLBの無効化
+        self.invalidate_tlb_range(virtual_addr, aligned_size);
+        
+        log::debug!("物理メモリマッピング完了: 物理=0x{:x}, 仮想=0x{:x}, サイズ=0x{:x}", 
+                   aligned_addr, virtual_addr, aligned_size);
+        
+        Ok(virtual_addr)
+    }
+
+    fn find_available_virtual_region(&self, size: usize) -> Result<usize, &'static str> {
+        // カーネル仮想アドレス空間でマッピング用の領域を探す
+        // 通常は0xFFFF800000000000以降の領域を使用
+        const KERNEL_VMEM_START: usize = 0xFFFF800000000000;
+        const KERNEL_VMEM_END: usize = 0xFFFFC00000000000;
+        
+        // 簡単な実装: 線形検索で空き領域を見つける
+        let mut current_addr = KERNEL_VMEM_START;
+        
+        while current_addr + size <= KERNEL_VMEM_END {
+            if self.is_virtual_region_available(current_addr, size) {
+                return Ok(current_addr);
+            }
+            current_addr += 0x200000; // 2MBずつ進む
+        }
+        
+        Err("仮想メモリ領域の確保に失敗しました")
+    }
+
+    fn is_virtual_region_available(&self, addr: usize, size: usize) -> bool {
+        // 指定された仮想アドレス領域が利用可能かチェック
+        let page_count = (size + 0xFFF) / 0x1000;
+        
+        for i in 0..page_count {
+            let check_addr = addr + (i * 0x1000);
+            if self.is_virtual_address_mapped(check_addr) {
+                return false;
+            }
+        }
+        
+        true
+    }
+
+    fn is_virtual_address_mapped(&self, addr: usize) -> bool {
+        // ページテーブルを確認して、指定された仮想アドレスがマッピング済みかチェック
+        crate::memory::page_table::is_page_mapped(addr)
+    }
+
+    fn map_page(&self, pte: &PageTableEntry) -> Result<(), &'static str> {
+        // ページテーブルエントリを実際のページテーブルに登録
+        crate::memory::page_table::map_page(
+            pte.virtual_address,
+            pte.physical_address,
+            pte.flags
+        )
+    }
+
+    fn convert_memory_flags_to_page_flags(&self, flags: MemoryFlags) -> crate::memory::PageFlags {
+        let mut page_flags = crate::memory::PageFlags::PRESENT;
+        
+        if flags.contains(MemoryFlags::WRITABLE) {
+            page_flags |= crate::memory::PageFlags::WRITABLE;
+        }
+        if flags.contains(MemoryFlags::USER_ACCESSIBLE) {
+            page_flags |= crate::memory::PageFlags::USER_ACCESSIBLE;
+        }
+        if flags.contains(MemoryFlags::CACHE_DISABLE) {
+            page_flags |= crate::memory::PageFlags::CACHE_DISABLE;
+        }
+        if flags.contains(MemoryFlags::WRITE_THROUGH) {
+            page_flags |= crate::memory::PageFlags::WRITE_THROUGH;
+        }
+        
+        page_flags
+    }
+
+    fn invalidate_tlb_range(&self, virtual_addr: usize, size: usize) {
+        // TLB（Translation Lookaside Buffer）の無効化
+        let page_count = (size + 0xFFF) / 0x1000;
+        
+        for i in 0..page_count {
+            let page_addr = virtual_addr + (i * 0x1000);
+            crate::arch::invalidate_tlb_page(page_addr);
+        }
+    }
+}
+
+impl Drop for VMemMapper {
+    fn drop(&mut self) {
+        // リソースのクリーンアップ
+        for pte in &self.page_table_entries {
+            let _ = crate::memory::page_table::unmap_page(pte.virtual_address);
+        }
+        
+        // TLB無効化
+        if self.virtual_base != 0 {
+            self.invalidate_tlb_range(self.virtual_base, self.size);
+        }
+        
+        log::debug!("VMemMapperクリーンアップ完了");
+    }
+}
+
+// 追加のデータ構造
+#[derive(Debug)]
+struct EcamRegion {
+    physical_base: u64,
+    virtual_base: usize,
+    size: usize,
+    segment_group: u16,
+    start_bus_number: u8,
+    end_bus_number: u8,
+    mapper: VMemMapper,
+}
+
+#[derive(Debug)]
+struct PageTableEntry {
+    virtual_address: usize,
+    physical_address: u64,
+    flags: crate::memory::PageFlags,
+}
+
+#[derive(Debug)]
+struct AccessStatistics {
+    read_count: core::sync::atomic::AtomicU64,
+    write_count: core::sync::atomic::AtomicU64,
+    error_count: core::sync::atomic::AtomicU64,
+}
+
+impl AccessStatistics {
+    fn new() -> Self {
+        Self {
+            read_count: core::sync::atomic::AtomicU64::new(0),
+            write_count: core::sync::atomic::AtomicU64::new(0),
+            error_count: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    
+    fn record_read(&self) {
+        self.read_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    
+    fn record_write(&self) {
+        self.write_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    
+    fn record_error(&self) {
+        self.error_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+bitflags::bitflags! {
+    struct MemoryFlags: u32 {
+        const READABLE = 1 << 0;
+        const WRITABLE = 1 << 1;
+        const EXECUTABLE = 1 << 2;
+        const USER_ACCESSIBLE = 1 << 3;
+        const CACHE_DISABLE = 1 << 4;
+        const WRITE_THROUGH = 1 << 5;
+        const WRITE_COMBINING = 1 << 6;
+    }
 } 
